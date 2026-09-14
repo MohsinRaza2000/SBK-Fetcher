@@ -35,6 +35,10 @@ GAP = 1.0
 # each maker - the newest results sit on page 1, so this is the daily top-up
 # without re-pulling 1.2M rows every time. --full forces a whole sweep.
 RECENT_PAGES = 25
+# The freshness pass: the first FRESH_PAGES pages of every maker, at most once
+# every FRESH_EVERY seconds. See the two-job comment in run().
+FRESH_PAGES = 3
+FRESH_EVERY = 20 * 3600
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, 'aaa_fetch_state.json')
 
@@ -142,7 +146,8 @@ def load_state():
             return json.load(io.open(STATE, encoding='utf-8'))
         except Exception:
             pass
-    return {'mIdx': 0, 'page': 1, 'sweeps': 0, 'sent': 0, 'totals': {}}
+    return {'mIdx': 0, 'page': 1, 'sweeps': 0, 'sent': 0, 'totals': {},
+            'fIdx': None, 'fPage': 1, 'fresh_at': 0}
 
 
 def save_state(s):
@@ -167,6 +172,8 @@ def run():
     if a.maker:
         ids = [i for i in ids if str(i) == str(a.maker)]
     s = load_state()
+    for k, v in (('fIdx', None), ('fPage', 1), ('fresh_at', 0)):
+        s.setdefault(k, v)          # a state file written before the fresh pass existed
     if s['mIdx'] >= len(ids):
         s['mIdx'] = 0; s['page'] = 1
     # The heavy first pull is one full sweep; after that, keep it light with the
@@ -180,20 +187,45 @@ def run():
     while True:
         if a.max_seconds and time.time() - began > a.max_seconds:
             print('time budget reached', flush=True); break
-        if s['mIdx'] >= len(ids):
+
+        # Which of the two jobs is this turn?
+        #
+        # FRESH: the first few pages of EVERY maker. The newest sales sit on page
+        # one, so this is what keeps the portal current - and without it nothing
+        # but TOYOTA would update for weeks, because the backfill below is still
+        # somewhere inside TOYOTA's 18,920 pages.
+        #
+        # BACKFILL: the deep cursor, one page at a time, filling in the history.
+        #
+        # A fresh pass is ~69 makers x 3 pages and takes about half an hour; it
+        # runs at most once every FRESH_EVERY, and the rest of the time goes to
+        # the backfill. The request rate is unchanged - this only decides which
+        # page the next request asks for.
+        if s.get('fIdx') is None and time.time() - float(s.get('fresh_at', 0)) > FRESH_EVERY:
+            s['fIdx'] = 0; s['fPage'] = 1
+            print('---- fresh pass: newest pages of every maker ----', flush=True)
+        fresh = s.get('fIdx') is not None
+        if fresh and s['fIdx'] >= len(ids):
+            s['fresh_at'] = time.time(); s['fIdx'] = None; save_state(s)
+            print('---- fresh pass done ----', flush=True)
+            continue
+        if not fresh and s['mIdx'] >= len(ids):
             s['sweeps'] += 1; s['mIdx'] = 0; s['page'] = 1; save_state(s)
             print('==== full sweep %d done ====' % s['sweeps'], flush=True)
             if a.once:
                 break
             continue
-        vid = ids[s['mIdx']]; name = makers[vid]
+
+        vid = ids[s['fIdx'] if fresh else s['mIdx']]
+        name = makers[vid]
+        pg = s['fPage'] if fresh else s['page']
         try:
-            rows, navi = page(op, form, vid, s['page'])
+            rows, navi = page(op, form, vid, pg)
         except Blocked as e:
             print('BLOCKED: %s -- this machine is now refused by aaajapan. Stopping.' % e, flush=True)
             save_state(s); sys.exit(2)
         except Exception as e:
-            print('read error %s (%s p%d) - relogin in 5s' % (str(e)[:60], name, s['page']), flush=True)
+            print('read error %s (%s p%d) - relogin in 5s' % (str(e)[:60], name, pg), flush=True)
             time.sleep(5)
             try:
                 op, form, makers = login(); ids = [i for i in makers.keys() if not a.maker or str(i) == str(a.maker)]
@@ -205,6 +237,7 @@ def run():
         s['totals'][vid] = total
         last = -(-total // 20) if total > 0 else 0
 
+        res = {}
         if rows:
             try:
                 res = send(rows, name)
@@ -215,23 +248,31 @@ def run():
                 stale += 1
                 wait = min(60, 5 * stale)
                 print('ingest error (try %d) %s (%s p%d) - waiting %ds'
-                      % (stale, str(e)[:160], name, s['page']), flush=True)
+                      % (stale, str(e)[:160], name, pg), flush=True)
                 if stale >= 8:
-                    print('  giving up on %s p%d for now - moving on' % (name, s['page']), flush=True)
+                    print('  giving up on %s p%d for now - moving on' % (name, pg), flush=True)
                     stale = 0
-                    s['page'] += 1
+                    if fresh: s['fPage'] += 1
+                    else: s['page'] += 1
                     save_state(s)
                     continue
                 time.sleep(wait); continue
 
-        cap = a.recent if a.recent > 0 else last
-        end_of_maker = (last > 0 and s['page'] >= min(last, cap if cap else last)) or (not rows and s['page'] >= 1)
-        if end_of_maker:
-            print('%-16s p%-5d of %-6d | %s rows total | in_db %s'
-                  % (name, s['page'], last, format(total, ','), format(res.get('in_db', 0), ',') if rows else '-'), flush=True)
-            s['mIdx'] += 1; s['page'] = 1
+        if fresh:
+            done_here = (last > 0 and pg >= min(last, FRESH_PAGES)) or pg >= FRESH_PAGES or not rows
+            if done_here:
+                s['fIdx'] += 1; s['fPage'] = 1
+            else:
+                s['fPage'] += 1
         else:
-            s['page'] += 1
+            cap = a.recent if a.recent > 0 else last
+            end_of_maker = (last > 0 and pg >= min(last, cap if cap else last)) or (not rows and pg >= 1)
+            if end_of_maker:
+                print('%-16s p%-5d of %-6d | %s rows total | in_db %s'
+                      % (name, pg, last, format(total, ','), format(res.get('in_db', 0), ',') if rows else '-'), flush=True)
+                s['mIdx'] += 1; s['page'] = 1
+            else:
+                s['page'] += 1
         save_state(s)
         time.sleep(GAP)
 
