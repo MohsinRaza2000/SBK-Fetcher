@@ -11,7 +11,7 @@ name: fetch-stats
 
 on:
   schedule:
-    - cron: '*/20 * * * *'
+    - cron: '17 * * * *'      # a safety net only - the run chains itself, see the last step
   workflow_dispatch: {}
 
 concurrency:
@@ -20,6 +20,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write        # so a finished run can start the next one (see below)
 
 jobs:
   fetch:
@@ -49,3 +50,24 @@ jobs:
             if git push; then echo "pushed"; break; fi
             echo "push retry $i"; sleep 4
           done
+
+      # Hand the baton on. The cron above is the intended trigger, but GitHub
+      # skips short-interval schedules under load - on 14 September not one
+      # scheduled run had fired in three and a half hours, so the chain would
+      # have ended with this job and the feed would have stopped silently.
+      # A finished run therefore starts the next one itself; the concurrency
+      # group keeps them one at a time. The elapsed-time guard means a job that
+      # dies in its first five minutes does NOT re-queue, so a broken run can
+      # never spin in a loop.
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mins=$(( ( $(date +%s) - $(date -d "${{ github.run_started_at }}" +%s) ) / 60 ))
+          echo "this run lasted ${mins} min"
+          if [ "$mins" -ge 5 ]; then
+            gh workflow run fetch.yml --ref main && echo "next run queued"
+          else
+            echo "too short - not re-queueing (guards against a crash loop)"
+          fi
