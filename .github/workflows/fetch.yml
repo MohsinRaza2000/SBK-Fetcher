@@ -3,9 +3,11 @@ name: fetch-stats
 # The SBK statistics data pipeline. GitHub's runners are not blocked by the
 # source (the SBK hosting server's IP is), so the fetch runs here and forwards
 # each page to the portal's ingest endpoint. Gentle: one request a second.
-# Runs every 20 minutes and fetches an ~18-minute chunk (newest makers/pages
-# first), so the ~1.2M-row history fills within about a day; after the first full
-# sweep the script only re-reads the newest pages (the daily top-up).
+# Each run fetches for up to 5.5 hours (newest makers/pages first) and commits its
+# cursor, so the ~1.2M-row history fills over a few days of gentle 1-req/sec
+# fetching. The cron re-queues it (the concurrency group keeps runs one-at-a-time,
+# so a queued run starts when the previous finishes = near-continuous). After the
+# first full sweep the script only re-reads the newest pages (the daily top-up).
 
 on:
   schedule:
@@ -22,7 +24,7 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,7 +36,7 @@ jobs:
           AAA_PASS: ${{ secrets.AAA_PASS }}
           AAA_INGEST_TOKEN: ${{ secrets.AAA_INGEST_TOKEN }}
           AAA_INGEST_URL: ${{ secrets.AAA_INGEST_URL }}
-        run: python aaa_fetch.py --max-seconds 1100
+        run: python aaa_fetch.py --max-seconds 19800
       - name: Save progress
         if: always()
         run: |
