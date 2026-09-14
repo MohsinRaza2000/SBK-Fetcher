@@ -46,11 +46,12 @@ STATE = os.path.join(HERE, 'aaa_fetch_state.json')
 # cut the ~6.7-day first pull). Each worker owns its own slice of the maker list
 # and its own cursor, so they never ask for the same page.
 WORKERS = int(os.environ.get('AAA_WORKERS', '3'))
-# The floor between ANY two requests to the source, across all workers. The source
-# takes ~7.6 s to answer, so three workers sit near 0.3 requests a second on their
-# own; this is the guard that keeps a fast answer from ever turning into a burst.
-# Never raise the rate past this without the owner - a blocked source costs days.
-GLOBAL_MIN_GAP = 0.5
+# The floor between ANY two requests to the source, across all workers - so the
+# whole job can never exceed one request a second, which is the owner's standing
+# rule (see the sbk-source-rate-safety note). Three workers reached 0.7 req/sec on
+# a fast runner, so this ceiling is real, not theoretical. Never raise it without
+# the owner: a blocked source costs days and there is no way to appeal it.
+GLOBAL_MIN_GAP = 1.0
 
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 
