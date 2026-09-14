@@ -32,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - name: Note the start time
+        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -69,7 +71,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mins=$(( ( $(date +%s) - $(date -d "${{ github.run_started_at }}" +%s) ) / 60 ))
+          # T0 is set by the first step of THIS job. github.run_started_at was
+          # tried first and gave 943 minutes for a six-minute run, which would
+          # have let a crash loop straight past the guard.
+          mins=$(( ( $(date +%s) - ${T0:-0} ) / 60 ))
           echo "this run lasted ${mins} min"
           if [ "$mins" -ge 5 ]; then
             gh workflow run fetch.yml --ref main && echo "next run queued"
