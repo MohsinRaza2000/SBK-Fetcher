@@ -113,11 +113,27 @@ def page(op, form, vid, pg):
 
 
 def send(rows, maker):
+    """POST one page to the portal. Raises with what the server actually said.
+
+    The bare json.loads() used to fail with "Expecting value: line 1 column 1",
+    which says nothing about the cause - and on 14 Sep the portal's host started
+    answering a runner with a non-JSON body, so the job retried the same page for
+    an hour learning nothing. The status and the first bytes are part of the error
+    now, so the next stall names itself."""
     data = json.dumps({'maker': maker, 'rows': rows}).encode('utf-8')
     r = urllib.request.Request(PORTAL + '?t=' + INGEST_TOKEN, data=data,
                                headers={'User-Agent': 'aaa-fetch', 'Content-Type': 'application/json'})
-    with urllib.request.urlopen(r, timeout=90, context=ctx) as x:
-        return json.loads(x.read().decode('utf-8', 'replace'))
+    try:
+        with urllib.request.urlopen(r, timeout=90, context=ctx) as x:
+            status, raw = x.status, x.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    body = raw.decode('utf-8', 'replace')
+    try:
+        return json.loads(body)
+    except ValueError:
+        snippet = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', body)).strip()[:200]
+        raise RuntimeError('portal answered HTTP %s, not JSON: %s' % (status, snippet or '(empty body)'))
 
 
 def load_state():
@@ -193,9 +209,20 @@ def run():
             try:
                 res = send(rows, name)
                 s['sent'] += res.get('written', 0)
+                stale = 0
             except Exception as e:
-                print('ingest error %s (%s p%d) - retry in 5s' % (str(e)[:60], name, s['page']), flush=True)
-                time.sleep(5); continue
+                # One page must never hold the whole job: back off, then skip it.
+                stale += 1
+                wait = min(60, 5 * stale)
+                print('ingest error (try %d) %s (%s p%d) - waiting %ds'
+                      % (stale, str(e)[:160], name, s['page']), flush=True)
+                if stale >= 8:
+                    print('  giving up on %s p%d for now - moving on' % (name, s['page']), flush=True)
+                    stale = 0
+                    s['page'] += 1
+                    save_state(s)
+                    continue
+                time.sleep(wait); continue
 
         cap = a.recent if a.recent > 0 else last
         end_of_maker = (last > 0 and s['page'] >= min(last, cap if cap else last)) or (not rows and s['page'] >= 1)
