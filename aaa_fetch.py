@@ -42,6 +42,16 @@ RECENT_PAGES = 25
 # every FRESH_EVERY seconds. See the two-job comment in run().
 FRESH_PAGES = 3
 FRESH_EVERY = 20 * 3600
+# A maker that keeps serving pages but has stopped giving us anything NEW has
+# given us all it will. The source caps one query at about 200,000 results:
+# TOYOTA sat at exactly 200,001 rows in the portal on 17 September 2026 while its
+# deep pages (the cursor was at page 14,086, far past the ~10,000th) went on
+# returning rows we already held - a run read 8,784 rows to find 151. Without
+# this a worker spends every request it has on one maker for ever and never
+# reaches the twenty-two behind it, which is why MITSUBISHI, SUBARU and
+# VOLKSWAGEN had about sixty rows each while their makers hold a hundred
+# thousand. Counted in the cursor, so it survives between runs.
+DRY_PAGES = 25
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, 'aaa_fetch_state.json')
 
@@ -385,6 +395,9 @@ def worker(wid, my_ids, s, lock, a, began, stop):
                 with lock:
                     s['sent'] = int(s.get('sent', 0)) + res.get('written', 0)
                 stale = 0
+                # Pages in a row that told us nothing we did not already have.
+                if not fresh:
+                    c['dry'] = 0 if res.get('written', 0) > 0 else int(c.get('dry', 0) or 0) + 1
             except Exception as e:
                 # One page must never hold a worker: back off, then skip it.
                 stale += 1
@@ -412,6 +425,14 @@ def worker(wid, my_ids, s, lock, a, began, stop):
             # to find 194 new ones. The sweep belongs to each worker, so the
             # decision does too - and with a daily allowance now, a request spent
             # on a page we already have is a request the backfill does not get.
+            if int(c.get('dry', 0) or 0) >= DRY_PAGES:
+                print('[%s] %-16s p%-5d | %d pages with nothing new - this maker has '
+                      'given us all it will, moving on' % (tag, name, pg, DRY_PAGES), flush=True)
+                c['dry'] = 0
+                c['mIdx'] += 1; c['page'] = 1
+                with lock: save_state(s)
+                time.sleep(GAP)
+                continue
             myrecent = a.recent
             if myrecent == 0 and not a.full and int(c.get('sweeps', 0) or 0) >= 1:
                 myrecent = RECENT_PAGES
@@ -420,7 +441,7 @@ def worker(wid, my_ids, s, lock, a, began, stop):
                 print('[%s] %-16s p%-5d of %-6d | %s rows at source | in_db %s'
                       % (tag, name, pg, last, format(total, ','),
                          format(res.get('in_db', 0), ',') if rows else '-'), flush=True)
-                c['mIdx'] += 1; c['page'] = 1
+                c['mIdx'] += 1; c['page'] = 1; c['dry'] = 0
             else:
                 c['page'] += 1
         with lock: save_state(s)
