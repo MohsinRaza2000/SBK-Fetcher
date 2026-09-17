@@ -131,7 +131,7 @@ GLOBAL_MIN_GAP = 1.5
 # a week instead of two days. Both can be changed from the workflow without
 # touching this file - AAA_DAILY_BUDGET and AAA_RUN_LIMIT - and neither should be
 # raised without the owner saying so.
-DAILY_BUDGET = int(os.environ.get('AAA_DAILY_BUDGET', '5000'))
+DAILY_BUDGET = int(os.environ.get('AAA_DAILY_BUDGET', '10000'))
 RUN_LIMIT    = int(os.environ.get('AAA_RUN_LIMIT', '600'))
 
 

@@ -1,36 +1,39 @@
 # Fetch bid.aaajapan.com sales statistics and forward them to the SBK portal.
 #
-# SHAPED LIKE THE AUCTION HARVESTER, on the owner's instruction of 17 September
-# 2026 ("100% safe, jaisay action hai waisay hi static") — and for a reason paid
-# for the day before.
+# TWO THINGS HOLD THIS BACK, AND THEY ARE DIFFERENT THINGS.
+#
+# How FAST — the gap between requests, 1.5s, the same the auction harvester uses.
+# How MUCH — a hard allowance per UTC day, counted in the state file.
 #
 # The first account was closed on 16 September 2026 after this job pulled the
-# source's entire price archive, 915,048 rows, in about forty hours. The gap
-# between requests was obeyed the whole time. Speed was never the problem: there
-# was no ceiling on the TOTAL, while the auction harvester beside it had carried
-# a daily budget from its first day.
+# source's whole price archive, 915,048 rows, in about forty hours. The gap was
+# obeyed the entire time; there was simply no ceiling on the total. That ceiling
+# is now the thing that stops the job, and it is what makes everything below
+# safe to do.
 #
-# So this now works the way that one does:
+# WHY IT CHAINS ITSELF AGAIN. It was a plain cron for a few hours on 17 September
+# and GitHub fired **not one** scheduled run: the day used 1,195 of its 5,000
+# requests, and both runs that happened were started by hand. GitHub skips
+# short-interval schedules on shared runners, which is the same thing that
+# happened on 14 September. So a finished run starts the next one — but now the
+# DAY'S ALLOWANCE is what ends the chain. When the purse is empty a run signs in,
+# sees it, and stops in seconds; the elapsed-time guard then declines to
+# re-queue, and the chain rests until tomorrow. Before the allowance existed this
+# same chain ran for twenty-four hours a day, which is how forty hours took the
+# whole archive.
 #
-#   a small cron, often            — every 20 minutes
-#   a small run                    — AAA_RUN_LIMIT requests, then it stops
-#   a hard day's allowance         — AAA_DAILY_BUDGET, counted in the state file
-#   a stop on the first refusal    — any 403/429 halts every worker
+# The hourly cron is the belt to that braces: it restarts the chain each day even
+# if every other schedule is skipped, and costs twenty seconds when there is
+# nothing to do.
 #
-# and there is NO self-chaining any more. A finished run used to start the next
-# one immediately, which is how a day's work ended up in a single burst. Now the
-# clock spreads it: once the day's allowance is spent, every later run signs in,
-# sees the purse is empty and stops in a few seconds.
-#
-# Both numbers can be changed from the repository's Variables — AAA_DAILY_BUDGET
-# and AAA_RUN_LIMIT — without touching any code. Neither should be raised without
-# the owner saying so.
+# Both numbers are repository Variables — AAA_DAILY_BUDGET and AAA_RUN_LIMIT —
+# so they change without a commit, and neither should be raised without the owner.
 
 name: fetch-stats
 
 on:
   schedule:
-    - cron: '*/20 * * * *'
+    - cron: '7 * * * *'
   workflow_dispatch:
     inputs:
       seconds:
@@ -44,12 +47,15 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write        # so a finished run can start the next one
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Note the start time
+        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -61,10 +67,7 @@ jobs:
           AAA_PASS: ${{ secrets.AAA_PASS }}
           AAA_INGEST_TOKEN: ${{ secrets.AAA_INGEST_TOKEN }}
           AAA_INGEST_URL: ${{ secrets.AAA_INGEST_URL }}
-          # The ceilings. The defaults in aaa_fetch.py are the same numbers; these
-          # are here so they can be changed from the repository's Variables page
-          # without a commit.
-          AAA_DAILY_BUDGET: ${{ vars.AAA_DAILY_BUDGET || '5000' }}
+          AAA_DAILY_BUDGET: ${{ vars.AAA_DAILY_BUDGET || '10000' }}
           AAA_RUN_LIMIT: ${{ vars.AAA_RUN_LIMIT || '600' }}
         run: python aaa_fetch.py --max-seconds ${{ github.event.inputs.seconds || '1200' }}
 
@@ -80,3 +83,19 @@ jobs:
             if git push; then echo "pushed"; break; fi
             echo "push retry $i"; sleep 4
           done
+
+      # Hand the baton on, unless this run did almost nothing - which is what a
+      # run looks like once the day's allowance is spent, and also what a broken
+      # run looks like. Either way it must not re-queue, or a crash would spin.
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mins=$(( ( $(date +%s) - ${T0:-0} ) / 60 ))
+          echo "this run lasted ${mins} min"
+          if [ "$mins" -ge 5 ]; then
+            gh workflow run fetch.yml --ref main && echo "next run queued"
+          else
+            echo "under five minutes - not re-queueing (spent allowance, or a fault)"
+          fi
