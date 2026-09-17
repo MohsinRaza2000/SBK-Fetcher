@@ -52,6 +52,50 @@ FRESH_EVERY = 20 * 3600
 # VOLKSWAGEN had about sixty rows each while their makers hold a hundred
 # thousand. Counted in the cursor, so it survives between runs.
 DRY_PAGES = 25
+
+# ---------------------------------------------------------------------------
+# GETTING UNDERNEATH THE SOURCE'S CAP.
+#
+# One query is served to about 200,000 results and no further: TOYOTA reports
+# 385,085 rows, and paging it straight through stopped at 200,001 while the
+# cursor went on to page 14,086 re-reading the same tail. The 185,000 behind
+# that wall cannot be paged to at all.
+#
+# But the search form carries a SALE DATE range - stDt1 / stDt2, YYYY-MM-DD -
+# and bounding it splits one query into several small ones. Measured on
+# 17 September 2026: TOYOTA is 68,487 rows in June, 141,769 in July and 101,749
+# in August. Every month is comfortably under the cap, and together they are the
+# whole maker.
+#
+# So a maker bigger than CAP_SAFE is walked a month at a time. Anything smaller
+# is asked for in one piece, as before - most makers never need this.
+CAP_SAFE = 180000
+# How many months back to walk a split maker. The archive itself only reaches
+# about three months; the extra months cost one request each and mean nothing is
+# missed if it ever reaches further.
+SPLIT_MONTHS = 8
+
+
+def month_slices(n=SPLIT_MONTHS):
+    """The last n calendar months as (first day, last day), newest first."""
+    y, m = time.gmtime().tm_year, time.gmtime().tm_mon
+    out = []
+    for _ in range(n):
+        if m == 12:
+            nxt_y, nxt_m = y + 1, 1
+        else:
+            nxt_y, nxt_m = y, m + 1
+        last = time.gmtime(time.mktime((nxt_y, nxt_m, 1, 12, 0, 0, 0, 0, 0)) - 86400)
+        out.append(('%04d-%02d-01' % (y, m), time.strftime('%Y-%m-%d', last)))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return out
+
+
+def slices_for(total):
+    """How to ask for a maker: whole, or month by month if the cap is in the way."""
+    return month_slices() if int(total or 0) > CAP_SAFE else [('', '')]
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, 'aaa_fetch_state.json')
 
@@ -239,9 +283,12 @@ def login():
     return op, form, mk
 
 
-def page(op, form, vid, pg):
+def page(op, form, vid, pg, d1='', d2=''):
     f = dict(form); f['vendor'] = str(vid); f['model'] = ''; f['page'] = str(max(1, pg))
     f['list_size'] = '20'; f['tpl'] = ''; f['is_stat'] = '0'
+    # The sale-date window, when this maker is being walked a month at a time.
+    # Empty for everyone else, which is the same request as before.
+    f['stDt1'] = d1; f['stDt2'] = d2
     url = BASE + '/st?file=loader&ajx=' + str(int(time.time() * 1000)) + '0-form'
     body = aaa(op, url, urllib.parse.urlencode(f))
     mm = re.search(r"'tpl_poisk':\s*'var data\s*=\s*(\{.*?\});'", body, re.S)
@@ -304,7 +351,8 @@ def save_state(s):
 
 
 def fresh_cursor():
-    return {'mIdx': 0, 'page': 1, 'fIdx': None, 'fPage': 1, 'fresh_at': 0, 'sweeps': 0}
+    return {'mIdx': 0, 'page': 1, 'sIdx': 0, 'dry': 0,
+            'fIdx': None, 'fPage': 1, 'fresh_at': 0, 'sweeps': 0}
 
 
 def worker(wid, my_ids, s, lock, a, began, stop):
@@ -357,8 +405,21 @@ def worker(wid, my_ids, s, lock, a, began, stop):
         vid = my_ids[c['fIdx'] if fresh else c['mIdx']]
         name = makers.get(vid, vid)
         pg = c['fPage'] if fresh else c['page']
+        # Which slice of this maker we are on. A maker under the cap has one
+        # slice - the whole thing - so nothing changes for almost all of them.
+        with lock:
+            known = int(s['totals'].get(vid, 0) or 0)
+        parts = [('', '')] if fresh else slices_for(known)
+        si = int(c.get('sIdx', 0) or 0)
+        if si >= len(parts):
+            c['sIdx'] = 0; c['dry'] = 0; c['page'] = 1
+            c['mIdx'] += 1
+            with lock: save_state(s)
+            continue
+        d1, d2 = parts[si]
+
         try:
-            rows, navi = page(op, form, vid, pg)
+            rows, navi = page(op, form, vid, pg, d1, d2)
         except Blocked as e:
             print('[%s] BLOCKED: %s -- the source is refusing us. Stopping every worker.' % (tag, e), flush=True)
             with lock: save_state(s)
@@ -382,11 +443,25 @@ def worker(wid, my_ids, s, lock, a, began, stop):
 
         total = int(navi.get('rows', 0) or 0)
         with lock:
-            if total:
+            # Only an UNBOUNDED answer says how big the maker is. A month's count
+            # would otherwise overwrite it and the maker would stop looking big
+            # enough to need splitting at all.
+            if total and not d1:
                 s['totals'][vid] = total
-            elif vid in s['totals']:
+            elif not total and vid in s['totals'] and not d1:
                 total = int(s['totals'][vid])
         last = -(-total // 20) if total > 0 else 0
+
+        # A cursor can outrun the slice it is in - the maker was split into
+        # months after this cursor was already fourteen thousand pages deep, and
+        # a month is only a few hundred. Start the slice properly instead of
+        # letting the advance rule skip straight past it.
+        if not fresh and last > 0 and pg > last:
+            print('[%s] %-16s%s | cursor was past the end (p%d of %d) - starting this part again'
+                  % (tag, name, (' ' + d1[:7] if d1 else ''), pg, last), flush=True)
+            c['page'] = 1; c['dry'] = 0
+            with lock: save_state(s)
+            continue
 
         res = {}
         if rows:
@@ -426,10 +501,13 @@ def worker(wid, my_ids, s, lock, a, began, stop):
             # decision does too - and with a daily allowance now, a request spent
             # on a page we already have is a request the backfill does not get.
             if int(c.get('dry', 0) or 0) >= DRY_PAGES:
-                print('[%s] %-16s p%-5d | %d pages with nothing new - this maker has '
-                      'given us all it will, moving on' % (tag, name, pg, DRY_PAGES), flush=True)
-                c['dry'] = 0
-                c['mIdx'] += 1; c['page'] = 1
+                print('[%s] %-16s%s p%-5d | %d pages with nothing new - moving on'
+                      % (tag, name, (' ' + d1[:7] if d1 else ''), pg, DRY_PAGES), flush=True)
+                c['dry'] = 0; c['page'] = 1
+                if len(parts) > 1:
+                    c['sIdx'] = si + 1      # try the next month of this maker
+                else:
+                    c['sIdx'] = 0; c['mIdx'] += 1
                 with lock: save_state(s)
                 time.sleep(GAP)
                 continue
@@ -438,10 +516,14 @@ def worker(wid, my_ids, s, lock, a, began, stop):
                 myrecent = RECENT_PAGES
             cap = myrecent if myrecent > 0 else last
             if (last > 0 and pg >= min(last, cap if cap else last)) or (not rows and pg >= 1):
-                print('[%s] %-16s p%-5d of %-6d | %s rows at source | in_db %s'
-                      % (tag, name, pg, last, format(total, ','),
+                print('[%s] %-16s%-9s p%-5d of %-6d | %s rows at source | in_db %s'
+                      % (tag, name, (' ' + d1[:7] if d1 else ''), pg, last, format(total, ','),
                          format(res.get('in_db', 0), ',') if rows else '-'), flush=True)
-                c['mIdx'] += 1; c['page'] = 1; c['dry'] = 0
+                c['page'] = 1; c['dry'] = 0
+                if len(parts) > 1 and si + 1 < len(parts):
+                    c['sIdx'] = si + 1      # the next month of the same maker
+                else:
+                    c['sIdx'] = 0; c['mIdx'] += 1
             else:
                 c['page'] += 1
         with lock: save_state(s)
