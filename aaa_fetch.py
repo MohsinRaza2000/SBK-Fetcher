@@ -404,7 +404,18 @@ def worker(wid, my_ids, s, lock, a, began, stop):
             else:
                 c['fPage'] += 1
         else:
-            cap = a.recent if a.recent > 0 else last
+            # A worker that has been all the way round ITS OWN makers does not
+            # need to walk them deeply again - the newest sales sit on page one.
+            # This used to be decided for everybody at once, from the SLOWEST
+            # worker, so two workers that had already finished kept re-reading
+            # ground they had covered: on 17 September 2026 a run read 8,784 rows
+            # to find 194 new ones. The sweep belongs to each worker, so the
+            # decision does too - and with a daily allowance now, a request spent
+            # on a page we already have is a request the backfill does not get.
+            myrecent = a.recent
+            if myrecent == 0 and not a.full and int(c.get('sweeps', 0) or 0) >= 1:
+                myrecent = RECENT_PAGES
+            cap = myrecent if myrecent > 0 else last
             if (last > 0 and pg >= min(last, cap if cap else last)) or (not rows and pg >= 1):
                 print('[%s] %-16s p%-5d of %-6d | %s rows at source | in_db %s'
                       % (tag, name, pg, last, format(total, ','),
