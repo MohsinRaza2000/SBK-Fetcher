@@ -351,7 +351,7 @@ def save_state(s):
 
 
 def fresh_cursor():
-    return {'mIdx': 0, 'page': 1, 'sIdx': 0, 'dry': 0,
+    return {'mIdx': 0, 'page': 1, 'sIdx': 0, 'dry': 0, 'won': 0,
             'fIdx': None, 'fPage': 1, 'fresh_at': 0, 'sweeps': 0}
 
 
@@ -395,11 +395,24 @@ def worker(wid, my_ids, s, lock, a, began, stop):
             print('[%s] ---- fresh pass done ----' % tag, flush=True)
             continue
         if not fresh and c['mIdx'] >= len(my_ids):
-            c['sweeps'] += 1; c['mIdx'] = 0; c['page'] = 1
+            c['sweeps'] += 1; c['mIdx'] = 0; c['page'] = 1; c['sIdx'] = 0
+            won = int(c.get('won', 0) or 0)
+            c['won'] = 0
             with lock: save_state(s)
-            print('[%s] ==== finished its makers (sweep %d) ====' % (tag, c['sweeps']), flush=True)
+            print('[%s] ==== finished its makers (sweep %d, %s new this pass) ===='
+                  % (tag, c['sweeps'], format(won, ',')), flush=True)
             if a.once:
                 break
+            # A worker that went all the way round its own makers and found
+            # NOTHING has nothing left to fetch. Going round again would spend
+            # the day's allowance on pages we already hold, while another worker
+            # still has a hundred thousand rows in front of it. So it stands
+            # aside for the rest of this run; the next run starts it fresh, and
+            # the freshness pass still brings its new sales in.
+            if won == 0 and c['sweeps'] > 1:
+                print('[%s] nothing new in a whole pass - leaving the rest of the '
+                      'allowance to the others' % tag, flush=True)
+                return
             continue
 
         vid = my_ids[c['fIdx'] if fresh else c['mIdx']]
@@ -473,6 +486,9 @@ def worker(wid, my_ids, s, lock, a, began, stop):
                 # Pages in a row that told us nothing we did not already have.
                 if not fresh:
                     c['dry'] = 0 if res.get('written', 0) > 0 else int(c.get('dry', 0) or 0) + 1
+                    # What this whole pass has actually been worth, so a worker
+                    # with nothing left to find can stand aside (see below).
+                    c['won'] = int(c.get('won', 0) or 0) + int(res.get('written', 0) or 0)
             except Exception as e:
                 # One page must never hold a worker: back off, then skip it.
                 stale += 1
