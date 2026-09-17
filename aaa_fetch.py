@@ -30,7 +30,10 @@ INGEST_TOKEN = os.environ.get('AAA_INGEST_TOKEN', '')
 USER = os.environ.get('AAA_USER', '')
 PW = os.environ.get('AAA_PASS', '')
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-GAP = 1.0
+# 1.5s, the same gap the auction harvester uses. It was 1.0 until 17 September
+# 2026; the gap was never what got the first account closed, but there is no
+# reason for this to be brisker than the feed we actually depend on.
+GAP = 1.5
 # After the first full sweep, later runs only re-read the first RECENT_PAGES of
 # each maker - the newest results sit on page 1, so this is the daily top-up
 # without re-pulling 1.2M rows every time. --full forces a whole sweep.
@@ -51,25 +54,101 @@ WORKERS = int(os.environ.get('AAA_WORKERS', '3'))
 # rule (see the sbk-source-rate-safety note). Three workers reached 0.7 req/sec on
 # a fast runner, so this ceiling is real, not theoretical. Never raise it without
 # the owner: a blocked source costs days and there is no way to appeal it.
-GLOBAL_MIN_GAP = 1.0
+GLOBAL_MIN_GAP = 1.5
+
+# ---------------------------------------------------------------------------
+# HOW MUCH, not just how fast. This is the protection that was missing.
+#
+# The first account was closed on 16 September 2026 after this job pulled
+# 915,048 rows - the source's whole price archive - in about forty hours. The
+# gap between requests was being obeyed the entire time. Speed was not the
+# problem; the total was, and there was no ceiling on the total at all, while
+# the auction harvester beside it had carried DAILY_BUDGET 25,000 from its first
+# day.
+#
+# So: a day's allowance, and a run's allowance, both counted in the one place
+# every source request passes through. When either is spent the workers stop
+# cleanly and the rest waits for the next run - nothing is lost, the cursors
+# keep their place.
+#
+# The numbers are deliberately far below what the auction is allowed, because
+# this is somebody else's archive on a free account rather than our own
+# supplier's daily list. At 5,000 a day the remaining history arrives over about
+# a week instead of two days. Both can be changed from the workflow without
+# touching this file - AAA_DAILY_BUDGET and AAA_RUN_LIMIT - and neither should be
+# raised without the owner saying so.
+DAILY_BUDGET = int(os.environ.get('AAA_DAILY_BUDGET', '5000'))
+RUN_LIMIT    = int(os.environ.get('AAA_RUN_LIMIT', '600'))
+
+
+def today_utc():
+    return time.strftime('%Y-%m-%d', time.gmtime())
 
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 
 
 class Blocked(Exception):
+    """The source refused us. Everything stops until a person looks."""
+    pass
+
+
+class Spent(Exception):
+    """The allowance is used up. Not an error - the job simply stops here."""
     pass
 
 
 class Throttle(object):
-    """One clock for every worker: no two source requests closer than `gap`."""
+    """One clock AND one purse for every worker.
 
-    def __init__(self, gap):
+    Two jobs in one object because they are the same question asked twice: may
+    this request go NOW, and may it go AT ALL. Every source request in this file
+    goes through take(), so nothing can slip past either the gap or the day's
+    allowance - which is exactly what went wrong before, when there was a gap and
+    no allowance at all.
+
+    The count is per UTC day and is carried in the state file, so a run that
+    stops for any reason cannot hand the next run a clean slate for the same day.
+    """
+
+    def __init__(self, gap, daily=0, run_cap=0):
         self.gap = gap
+        self.daily = daily
+        self.run_cap = run_cap
         self.lock = threading.Lock()
         self.next_at = 0.0
+        self.day = today_utc()
+        self.used = 0
+        self.this_run = 0
 
-    def wait(self):
+    def load(self, saved):
+        """Pick up what earlier runs spent today. Another day starts at nought."""
         with self.lock:
+            self.day = today_utc()
+            self.used = int(saved.get('used', 0) or 0) \
+                if isinstance(saved, dict) and saved.get('day') == self.day else 0
+
+    def snapshot(self):
+        with self.lock:
+            return {'day': self.day, 'used': self.used}
+
+    def left(self):
+        with self.lock:
+            return max(0, self.daily - self.used) if self.daily else -1
+
+    def take(self):
+        """Claim one request, or raise Spent. Waits out the gap before returning."""
+        with self.lock:
+            if today_utc() != self.day:      # midnight passed while we were running
+                self.day = today_utc()
+                self.used = 0
+            if self.daily and self.used >= self.daily:
+                raise Spent("today's allowance of %s requests is spent"
+                            % format(self.daily, ','))
+            if self.run_cap and self.this_run >= self.run_cap:
+                raise Spent('this run has used its %s requests'
+                            % format(self.run_cap, ','))
+            self.used += 1
+            self.this_run += 1
             now = time.time()
             due = max(now, self.next_at)
             self.next_at = due + self.gap
@@ -78,7 +157,7 @@ class Throttle(object):
             time.sleep(delay)
 
 
-THROTTLE = Throttle(GLOBAL_MIN_GAP)
+THROTTLE = Throttle(GLOBAL_MIN_GAP, DAILY_BUDGET, RUN_LIMIT)
 
 
 def new_opener():
@@ -87,7 +166,7 @@ def new_opener():
 
 
 def aaa(op, url, data=None, ref='/st?classic'):
-    THROTTLE.wait()
+    THROTTLE.take()
     r = urllib.request.Request(url, data=(data.encode() if data else None),
                                headers={'User-Agent': UA, 'Referer': BASE + ref})
     try:
@@ -100,12 +179,34 @@ def aaa(op, url, data=None, ref='/st?classic'):
 
 
 def login():
+    """Sign in the way the page's own form does.
+
+    Two things changed on 16 September 2026 and both are worth keeping written
+    down. The form moved: it posts to **/st** with `ref=st` (it was /aj_3), and
+    the page's button first asks **m?name=login&file=xloader**, which answers
+    `q: 1` for good details and the reason in words for bad ones. That answer is
+    the quickest way to tell a dead account from a changed page.
+
+    And the old success check was wrong: it accepted the page if the word
+    "logout" appeared anywhere, and that word is in the navigation **even for a
+    guest**. So a failed sign-in sailed past it and fell over later on a missing
+    search form, which read as "the source changed its markup" when the truth was
+    "this account no longer exists". The check now looks for the two things we
+    actually need - the maker list and the search form - and nothing else.
+    """
     op = new_opener()
-    aaa(op, BASE + '/aj_3', ref='/aj_3'); time.sleep(GAP)
-    aaa(op, BASE + '/aj_3', urllib.parse.urlencode({'username': USER, 'password': PW, 'is_login': '1', 'ref': 'aj_3'}), '/aj_3'); time.sleep(GAP)
+    aaa(op, BASE + '/st?classic'); time.sleep(GAP)
+
+    creds = urllib.parse.urlencode({'username': USER, 'password': PW,
+                                    'is_login': '1', 'ref': 'st'})
+    ans = aaa(op, BASE + '/m?name=login&file=xloader', creds, '/st?classic')
+    q = re.search(r"'q'\s*:\s*'([^']*)'", ans)
+    if q and q.group(1).strip() != '1':
+        raise RuntimeError('the source refused these details: %s' % q.group(1).strip())
+    time.sleep(GAP)
+
+    aaa(op, BASE + '/st', creds, '/st?classic'); time.sleep(GAP)
     h = aaa(op, BASE + '/st?classic')
-    if 'logout' not in h:
-        raise RuntimeError('login failed (no logout link)')
     mk = {}
     m = re.search(r'id=manuf_str[^>]*>([^<]*)<', h)
     for bit in (m.group(1).split(';') if m else []):
@@ -122,7 +223,9 @@ def login():
                 v = re.search(r'value=(["\'])(.*?)\1', tag, re.S)
                 form[n.group(1)] = v.group(2) if v else ''
     if not mk or not form:
-        raise RuntimeError('makers or form not found after login')
+        raise RuntimeError('signed in, but the maker list and search form are not on '
+                           'the page - the source has changed, or this account cannot '
+                           'reach statistics')
     return op, form, mk
 
 
@@ -184,6 +287,9 @@ def load_state():
 
 
 def save_state(s):
+    # The purse is written with the cursors, every time, so however a run ends
+    # the next one knows what today has already cost.
+    s['budget'] = THROTTLE.snapshot()
     io.open(STATE, 'w', encoding='utf-8').write(json.dumps(s))
 
 
@@ -245,6 +351,13 @@ def worker(wid, my_ids, s, lock, a, began, stop):
             rows, navi = page(op, form, vid, pg)
         except Blocked as e:
             print('[%s] BLOCKED: %s -- the source is refusing us. Stopping every worker.' % (tag, e), flush=True)
+            with lock: save_state(s)
+            stop.set()
+            return
+        except Spent as e:
+            # Not a fault: the allowance is simply used up. The cursors keep
+            # their place, so the next run carries on from here.
+            print('[%s] %s. Stopping - the rest waits for the next run.' % (tag, e), flush=True)
             with lock: save_state(s)
             stop.set()
             return
@@ -317,6 +430,17 @@ def run():
         sys.exit('AAA_USER, AAA_PASS and AAA_INGEST_TOKEN must be set in the environment.')
 
     began = time.time()
+
+    # The purse is read before anything is spent, the login included - otherwise
+    # a day whose allowance is already gone would still pay for four requests
+    # every hour just to find that out.
+    s = load_state()
+    THROTTLE.load(s.get('budget'))
+    if THROTTLE.left() == 0:
+        print('today has already used its %s requests. Nothing to do until tomorrow.'
+              % format(DAILY_BUDGET, ','), flush=True)
+        return
+
     op, form, makers = login()          # once, just to learn the maker list
     ids = list(makers.keys())
     if a.maker:
@@ -324,7 +448,6 @@ def run():
     if not ids:
         sys.exit('no makers to work on')
 
-    s = load_state()
     s.setdefault('totals', {})
     s.setdefault('sent', 0)
     if 'w' not in s:
@@ -348,8 +471,11 @@ def run():
     swept = min((int(c.get('sweeps', 0) or 0) for c in s['w'].values()), default=0)
     if a.recent == 0 and not a.full and swept >= 1:
         a.recent = RECENT_PAGES     # the history is in; keep later runs light
-    print('login ok | %d makers | %d workers | source gap %.1fs (floor %.1fs) | sent so far %s'
-          % (len(ids), nw, GAP, GLOBAL_MIN_GAP, format(int(s.get('sent', 0)), ',')), flush=True)
+    print('login ok | %d makers | %d workers | gap %.1fs | today %s of %s requests used, '
+          '%s per run | sent so far %s'
+          % (len(ids), nw, GLOBAL_MIN_GAP,
+             format(THROTTLE.snapshot()['used'], ','), format(DAILY_BUDGET, ','),
+             format(RUN_LIMIT, ','), format(int(s.get('sent', 0)), ',')), flush=True)
 
     lock = threading.Lock()
     stop = threading.Event()
@@ -366,7 +492,11 @@ def run():
 
     done = ', '.join('w%s %d/%d makers' % (wid, c.get('mIdx', 0), len(ids[int(wid)::nw]))
                      for wid, c in sorted(s['w'].items()))
-    print('stopped | rows sent all-time %s | %s' % (format(int(s.get('sent', 0)), ','), done), flush=True)
+    snap = THROTTLE.snapshot()
+    print('stopped | rows sent all-time %s | today %s of %s requests used (%s left) | %s'
+          % (format(int(s.get('sent', 0)), ','), format(snap['used'], ','),
+             format(DAILY_BUDGET, ','), format(max(0, DAILY_BUDGET - snap['used']), ','), done),
+          flush=True)
 
 
 if __name__ == '__main__':

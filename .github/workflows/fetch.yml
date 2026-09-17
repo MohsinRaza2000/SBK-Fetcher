@@ -1,23 +1,42 @@
-name: fetch-stats
+# Fetch bid.aaajapan.com sales statistics and forward them to the SBK portal.
+#
+# SHAPED LIKE THE AUCTION HARVESTER, on the owner's instruction of 17 September
+# 2026 ("100% safe, jaisay action hai waisay hi static") — and for a reason paid
+# for the day before.
+#
+# The first account was closed on 16 September 2026 after this job pulled the
+# source's entire price archive, 915,048 rows, in about forty hours. The gap
+# between requests was obeyed the whole time. Speed was never the problem: there
+# was no ceiling on the TOTAL, while the auction harvester beside it had carried
+# a daily budget from its first day.
+#
+# So this now works the way that one does:
+#
+#   a small cron, often            — every 20 minutes
+#   a small run                    — AAA_RUN_LIMIT requests, then it stops
+#   a hard day's allowance         — AAA_DAILY_BUDGET, counted in the state file
+#   a stop on the first refusal    — any 403/429 halts every worker
+#
+# and there is NO self-chaining any more. A finished run used to start the next
+# one immediately, which is how a day's work ended up in a single burst. Now the
+# clock spreads it: once the day's allowance is spent, every later run signs in,
+# sees the purse is empty and stops in a few seconds.
+#
+# Both numbers can be changed from the repository's Variables — AAA_DAILY_BUDGET
+# and AAA_RUN_LIMIT — without touching any code. Neither should be raised without
+# the owner saying so.
 
-# The SBK statistics data pipeline. GitHub's runners are not blocked by the
-# source (the SBK hosting server's IP is), so the fetch runs here and forwards
-# each page to the portal's ingest endpoint. Gentle: one request a second.
-# Each run fetches for up to 5.5 hours (newest makers/pages first) and commits its
-# cursor, so the ~1.2M-row history fills over a few days of gentle 1-req/sec
-# fetching. The cron re-queues it (the concurrency group keeps runs one-at-a-time,
-# so a queued run starts when the previous finishes = near-continuous). After the
-# first full sweep the script only re-reads the newest pages (the daily top-up).
+name: fetch-stats
 
 on:
   schedule:
-    - cron: '17 * * * *'      # a safety net only - the run chains itself, see the last step
+    - cron: '*/20 * * * *'
   workflow_dispatch:
     inputs:
       seconds:
-        description: 'How long this run fetches for (default 5.5 hours)'
+        description: 'How long this run may fetch for (the request limit usually stops it first)'
         required: false
-        default: '19800'
+        default: '1200'
 
 concurrency:
   group: fetch-stats
@@ -25,26 +44,30 @@ concurrency:
 
 permissions:
   contents: write
-  actions: write        # so a finished run can start the next one (see below)
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 30
     steps:
-      - name: Note the start time
-        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Fetch a chunk and forward it to the portal
         env:
           AAA_USER: ${{ secrets.AAA_USER }}
           AAA_PASS: ${{ secrets.AAA_PASS }}
           AAA_INGEST_TOKEN: ${{ secrets.AAA_INGEST_TOKEN }}
           AAA_INGEST_URL: ${{ secrets.AAA_INGEST_URL }}
-        run: python aaa_fetch.py --max-seconds ${{ github.event.inputs.seconds || '19800' }}
+          # The ceilings. The defaults in aaa_fetch.py are the same numbers; these
+          # are here so they can be changed from the repository's Variables page
+          # without a commit.
+          AAA_DAILY_BUDGET: ${{ vars.AAA_DAILY_BUDGET || '5000' }}
+          AAA_RUN_LIMIT: ${{ vars.AAA_RUN_LIMIT || '600' }}
+        run: python aaa_fetch.py --max-seconds ${{ github.event.inputs.seconds || '1200' }}
+
       - name: Save progress
         if: always()
         run: |
@@ -57,27 +80,3 @@ jobs:
             if git push; then echo "pushed"; break; fi
             echo "push retry $i"; sleep 4
           done
-
-      # Hand the baton on. The cron above is the intended trigger, but GitHub
-      # skips short-interval schedules under load - on 14 September not one
-      # scheduled run had fired in three and a half hours, so the chain would
-      # have ended with this job and the feed would have stopped silently.
-      # A finished run therefore starts the next one itself; the concurrency
-      # group keeps them one at a time. The elapsed-time guard means a job that
-      # dies in its first five minutes does NOT re-queue, so a broken run can
-      # never spin in a loop.
-      - name: Start the next run
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # T0 is set by the first step of THIS job. github.run_started_at was
-          # tried first and gave 943 minutes for a six-minute run, which would
-          # have let a crash loop straight past the guard.
-          mins=$(( ( $(date +%s) - ${T0:-0} ) / 60 ))
-          echo "this run lasted ${mins} min"
-          if [ "$mins" -ge 5 ]; then
-            gh workflow run fetch.yml --ref main && echo "next run queued"
-          else
-            echo "too short - not re-queueing (guards against a crash loop)"
-          fi
