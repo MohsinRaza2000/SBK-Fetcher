@@ -151,6 +151,24 @@ class Spent(Exception):
     pass
 
 
+class Door(Blocked):
+    """Turned away at the very first page, BEFORE we have said who we are.
+
+    Nothing identifies us at that point but the address of the machine asking,
+    so this is the source refusing that one GitHub machine - not the account.
+    Seen 2026-09-18 00:00 UTC: one runner got 403 on /st?classic, the next run
+    (another machine) four hours later signed in and worked all morning. A 403
+    AFTER signing in is still a plain Blocked and still stops everything.
+    """
+    pass
+
+
+# How many runs in a row may be turned away at the door before the job stops
+# asking and says so out loud (a failed run = an e-mail to the owner).
+DOOR_LIMIT = 4
+RETRY_MARK = os.path.join(HERE, '.retry')
+
+
 class Throttle(object):
     """One clock AND one purse for every worker.
 
@@ -249,7 +267,15 @@ def login():
     actually need - the maker list and the search form - and nothing else.
     """
     op = new_opener()
-    aaa(op, BASE + '/st?classic'); time.sleep(GAP)
+    try:
+        aaa(op, BASE + '/st?classic')
+    except Blocked as e:
+        raise Door(str(e))
+    except (urllib.error.URLError, OSError) as e:
+        # The source did not answer at all (down, or this machine cannot reach
+        # it). Same remedy as a refusal at the door: another machine, later.
+        raise Door('no answer: %s' % str(e)[:80])
+    time.sleep(GAP)
 
     creds = urllib.parse.urlencode({'username': USER, 'password': PW,
                                     'is_login': '1', 'ref': 'st'})
@@ -374,6 +400,13 @@ def worker(wid, my_ids, s, lock, a, began, stop):
     tag = 'w%d' % wid
     try:
         op, form, makers = login()
+    except Blocked as e:
+        # Seconds after the main sign-in worked from this same machine, so this
+        # is a real refusal, not a stray address: everybody stops.
+        print('[%s] BLOCKED at sign-in: %s -- stopping every worker.' % (tag, e), flush=True)
+        with lock: save_state(s)
+        stop.set()
+        return
     except Exception as e:
         print('[%s] login failed: %s' % (tag, str(e)[:80]), flush=True)
         return
@@ -450,6 +483,11 @@ def worker(wid, my_ids, s, lock, a, began, stop):
             time.sleep(5)
             try:
                 op, form, makers = login()
+            except Blocked as e2:
+                print('[%s] BLOCKED at relogin: %s -- stopping every worker.' % (tag, e2), flush=True)
+                with lock: save_state(s)
+                stop.set()
+                return
             except Exception as e2:
                 print('[%s] relogin failed: %s' % (tag, str(e2)[:60]), flush=True); time.sleep(30)
             continue
@@ -571,7 +609,28 @@ def run():
               % format(DAILY_BUDGET, ','), flush=True)
         return
 
-    op, form, makers = login()          # once, just to learn the maker list
+    try:
+        op, form, makers = login()      # once, just to learn the maker list
+    except Door as e:
+        door = int(s.get('door', 0) or 0) + 1
+        s['door'] = door
+        save_state(s)                   # the refused request still counts against today
+        if door < DOOR_LIMIT:
+            io.open(RETRY_MARK, 'w').write('door')
+            print('turned away at the door (%s). That is the address of this GitHub machine, not the '
+                  'account - asking again from another machine (%d of %d).'
+                  % (e, door, DOOR_LIMIT - 1), flush=True)
+            return
+        if door == DOOR_LIMIT:
+            print('turned away at the door %d runs in a row (%s). Stopping loudly so a person looks.'
+                  % (door, e), flush=True)
+            sys.exit(1)
+        print('still turned away at the door (%d runs in a row; the owner was told at %d). '
+              'Trying again on the next schedule.' % (door, DOOR_LIMIT), flush=True)
+        return
+    if s.get('door'):
+        print('in again after %d refusal(s) at the door' % int(s['door']), flush=True)
+    s['door'] = 0
     ids = list(makers.keys())
     if a.maker:
         ids = [i for i in ids if str(i) == str(a.maker)]
