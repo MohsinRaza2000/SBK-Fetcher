@@ -22,9 +22,19 @@
 # same chain ran for twenty-four hours a day, which is how forty hours took the
 # whole archive.
 #
-# The hourly cron is the belt to that braces: it restarts the chain each day even
-# if every other schedule is skipped, and costs twenty seconds when there is
-# nothing to do.
+# The cron is the belt to that braces: it restarts the chain each day. It fires
+# twice an hour because GitHub skips schedules freely - on 18 September not one
+# of the 01:07, 02:07 or 03:07 runs happened, and the day started four hours
+# late. A run on a spent day never touches the source (the allowance is read
+# before signing in), so the extra schedules cost the source nothing.
+#
+# TURNED AWAY AT THE DOOR (18 September 2026, 00:00 UTC). One GitHub machine got
+# 403 on the very first page, before signing in - nothing identifies us there but
+# that machine's address, and the next machine worked all morning. aaa_fetch.py
+# now treats that as the machine's problem: the run ends quietly, leaves a
+# `.retry` mark, and the step at the bottom asks for another machine straight
+# away. Four refusals in a row fail the run on purpose, which e-mails the owner
+# once. A refusal AFTER signing in still stops everything, as it always did.
 #
 # Both numbers are repository Variables — AAA_DAILY_BUDGET and AAA_RUN_LIMIT —
 # so they change without a commit, and neither should be raised without the owner.
@@ -33,7 +43,7 @@ name: fetch-stats
 
 on:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '7,37 * * * *'
   workflow_dispatch:
     inputs:
       seconds:
@@ -94,7 +104,11 @@ jobs:
         run: |
           mins=$(( ( $(date +%s) - ${T0:-0} ) / 60 ))
           echo "this run lasted ${mins} min"
-          if [ "$mins" -ge 5 ]; then
+          if [ -f .retry ]; then
+            echo "turned away at the door - asking again from another machine in 30s"
+            sleep 30
+            gh workflow run fetch.yml --ref main && echo "next run queued"
+          elif [ "$mins" -ge 5 ]; then
             gh workflow run fetch.yml --ref main && echo "next run queued"
           else
             echo "under five minutes - not re-queueing (spent allowance, or a fault)"
