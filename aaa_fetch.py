@@ -1,30 +1,33 @@
 # -*- coding: utf-8 -*-
 """Fetch bid.aaajapan.com sales statistics and forward them to the SBK portal.
 
-  python aaa_fetch.py [--recent N] [--maker ID] [--max-seconds S] [--once]
+  python aaa_fetch.py [--max-seconds S] [--maker ID] [--workers N] [--once] [--plan]
 
-This runs on a machine aaajapan does NOT block (the owner's PC, or a small
-always-on cloud box) - NOT the SBK server, whose IP aaajapan refuses. It logs in,
-pages through each maker's results, and POSTs each page to the portal's
-aaa-stats-ingest.php, which writes them to car_stats. All the DB knowledge lives
-in the ingest endpoint; this side just logs in, pages and forwards.
+Runs on GitHub Actions: aaajapan refuses the portal's own server, but not these
+machines. It does not page through makers blindly any more - it COMPARES COUNTS.
+The source says how many results a maker has in a sale-date window (the first
+page of any answer carries the total); the portal says how many it already holds
+for the same window (aaa-stats-ingest.php?have=, which costs the source nothing);
+and only a window that is short gets read. Every page read goes to the ingest,
+which writes car_stats and answers how many of its rows were new.
 
-  --recent N     only the first N pages of each maker (daily top-up of new results)
-  --maker ID     one maker only (e.g. 1 = TOYOTA)
-  --max-seconds  stop after S seconds (for cron); default: run until a full sweep
-                 finishes, then keep sweeping
-  --once         do a single full sweep and stop
+  --max-seconds  how long this run may last (the workflow passes 1200)
+  --maker ID     one maker only (1 = TOYOTA) - for trying things by hand
+  --workers N    how many signed-in readers share the work (default 3)
+  --once         one round of work, then stop - no waiting for the next check
+  --plan         print what this run would look at, and stop. Asks the source
+                 nothing (the portal's counts are read, nothing is written).
 
-State (which maker, which page) is kept in aaa_fetch_state.json beside this file,
-so a stop and restart carries on where it left off. Gentle: GAP seconds between
-aaajapan requests. Full first pull is ~60,000 requests, ~17 hours.
+State lives in aaa_fetch_state.json beside this file and the workflow commits
+it back: the day's request count, the windows already known to be complete, and
+where the check of the newest sale days has got to.
 """
-import argparse, io, json, os, re, ssl, sys, threading, time, urllib.parse, urllib.request, http.cookiejar
+import argparse, datetime, io, json, os, re, ssl, sys, threading, time, urllib.parse, urllib.request, http.cookiejar
 
 BASE = 'https://bid.aaajapan.com'
 # Everything secret comes from the environment, so this file is safe in a public
 # repo. GitHub Actions passes them from repository Secrets; locally, set them in
-# the shell before running (see the header). No credential is ever in the code.
+# the shell before running. No credential is ever in the code.
 PORTAL = os.environ.get('AAA_INGEST_URL', 'https://auction.sbkautotrading.com/aaa-stats-ingest.php')
 INGEST_TOKEN = os.environ.get('AAA_INGEST_TOKEN', '')
 USER = os.environ.get('AAA_USER', '')
@@ -34,105 +37,91 @@ UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 # 2026; the gap was never what got the first account closed, but there is no
 # reason for this to be brisker than the feed we actually depend on.
 GAP = 1.5
-# After the first full sweep, later runs only re-read the first RECENT_PAGES of
-# each maker - the newest results sit on page 1, so this is the daily top-up
-# without re-pulling 1.2M rows every time. --full forces a whole sweep.
-RECENT_PAGES = 25
-# The freshness pass: the first FRESH_PAGES pages of every maker, at most once
-# every FRESH_EVERY seconds. See the two-job comment in run().
-FRESH_PAGES = 3
-FRESH_EVERY = 20 * 3600
-# A maker that keeps serving pages but has stopped giving us anything NEW has
-# given us all it will. The source caps one query at about 200,000 results:
-# TOYOTA sat at exactly 200,001 rows in the portal on 17 September 2026 while its
-# deep pages (the cursor was at page 14,086, far past the ~10,000th) went on
-# returning rows we already held - a run read 8,784 rows to find 151. Without
-# this a worker spends every request it has on one maker for ever and never
-# reaches the twenty-two behind it, which is why MITSUBISHI, SUBARU and
-# VOLKSWAGEN had about sixty rows each while their makers hold a hundred
-# thousand. Counted in the cursor, so it survives between runs.
-DRY_PAGES = 25
+PAGE_ROWS = 20          # fixed at the source: list_size is accepted and ignored
 
-# ---------------------------------------------------------------------------
-# GETTING UNDERNEATH THE SOURCE'S CAP.
-#
-# One query is served to about 200,000 results and no further: TOYOTA reports
-# 385,085 rows, and paging it straight through stopped at 200,001 while the
-# cursor went on to page 14,086 re-reading the same tail. The 185,000 behind
-# that wall cannot be paged to at all.
-#
-# But the search form carries a SALE DATE range - stDt1 / stDt2, YYYY-MM-DD -
-# and bounding it splits one query into several small ones. Measured on
-# 17 September 2026: TOYOTA is 68,487 rows in June, 141,769 in July and 101,749
-# in August. Every month is comfortably under the cap, and together they are the
-# whole maker.
-#
-# So a maker bigger than CAP_SAFE is walked a month at a time. Anything smaller
-# is asked for in one piece, as before - most makers never need this.
-CAP_SAFE = 180000
-# How many months back to walk a split maker. The archive itself only reaches
-# about three months; the extra months cost one request each and mean nothing is
-# missed if it ever reaches further.
-SPLIT_MONTHS = 8
-
-
-def month_slices(n=SPLIT_MONTHS):
-    """The last n calendar months as (first day, last day), newest first."""
-    y, m = time.gmtime().tm_year, time.gmtime().tm_mon
-    out = []
-    for _ in range(n):
-        if m == 12:
-            nxt_y, nxt_m = y + 1, 1
-        else:
-            nxt_y, nxt_m = y, m + 1
-        last = time.gmtime(time.mktime((nxt_y, nxt_m, 1, 12, 0, 0, 0, 0, 0)) - 86400)
-        out.append(('%04d-%02d-01' % (y, m), time.strftime('%Y-%m-%d', last)))
-        m -= 1
-        if m == 0:
-            y, m = y - 1, 12
-    return out
-
-
-def slices_for(total):
-    """How to ask for a maker: whole, or month by month if the cap is in the way."""
-    return month_slices() if int(total or 0) > CAP_SAFE else [('', '')]
-HERE = os.path.dirname(os.path.abspath(__file__))
-STATE = os.path.join(HERE, 'aaa_fetch_state.json')
-
-# How many makers are worked on at once (the owner's yes, 14 September 2026, to
-# cut the ~6.7-day first pull). Each worker owns its own slice of the maker list
-# and its own cursor, so they never ask for the same page.
+# How many signed-in readers work at once (the owner's yes, 14 September 2026).
+# They take windows from one shared list, so two can never read the same page.
 WORKERS = int(os.environ.get('AAA_WORKERS', '3'))
-# The floor between ANY two requests to the source, across all workers - so the
-# whole job can never exceed one request a second, which is the owner's standing
-# rule (see the sbk-source-rate-safety note). Three workers reached 0.7 req/sec on
-# a fast runner, so this ceiling is real, not theoretical. Never raise it without
-# the owner: a blocked source costs days and there is no way to appeal it.
+# A round starts with ONE reader. Another signs in only when a reader has been on
+# one window for EXTRA_AFTER seconds (a long read) while others wait - so a
+# round of quick checks costs one sign-in (4 requests), not three (12).
+EXTRA_AFTER = 20
+EXTRA_GAP = 10          # at least this long between two extra sign-ins
+POLL = 2.0              # how often the run looks at its readers
+# The floor between ANY two requests to the source, across all readers - one
+# clock for everyone (see the sbk-source-rate-safety note). Never lower it
+# without the owner: a blocked source costs days and there is no appeal.
 GLOBAL_MIN_GAP = 1.5
 
 # ---------------------------------------------------------------------------
-# HOW MUCH, not just how fast. This is the protection that was missing.
+# HOW MUCH, not just how fast.
 #
 # The first account was closed on 16 September 2026 after this job pulled
 # 915,048 rows - the source's whole price archive - in about forty hours. The
-# gap between requests was being obeyed the entire time. Speed was not the
-# problem; the total was, and there was no ceiling on the total at all, while
-# the auction harvester beside it had carried DAILY_BUDGET 25,000 from its first
-# day.
-#
-# So: a day's allowance, and a run's allowance, both counted in the one place
-# every source request passes through. When either is spent the workers stop
-# cleanly and the rest waits for the next run - nothing is lost, the cursors
-# keep their place.
-#
-# The numbers are deliberately far below what the auction is allowed, because
-# this is somebody else's archive on a free account rather than our own
-# supplier's daily list. At 5,000 a day the remaining history arrives over about
-# a week instead of two days. Both can be changed from the workflow without
-# touching this file - AAA_DAILY_BUDGET and AAA_RUN_LIMIT - and neither should be
-# raised without the owner saying so.
+# gap was obeyed the entire time; there was no ceiling on the TOTAL. So: a day's
+# allowance and a run's allowance, both counted in the one place every source
+# request passes through. When either is spent the readers stop cleanly - the
+# portal's counts say where to carry on, so nothing is lost. Both are repository
+# Variables (AAA_DAILY_BUDGET, AAA_RUN_LIMIT); neither is raised without the owner.
 DAILY_BUDGET = int(os.environ.get('AAA_DAILY_BUDGET', '10000'))
 RUN_LIMIT    = int(os.environ.get('AAA_RUN_LIMIT', '600'))
+
+# ---------------------------------------------------------------------------
+# THE ORDER THE SOURCE SERVES ROWS IN - and why, until 19 September 2026, this
+# job kept asking for the wrong pages.
+#
+# A result list is sorted by MODEL NAME, A to Z - not by date. NISSAN's first
+# 500 rows are its "180 SX" and "AD" rows from sixty-eight different sale days.
+# The old fetcher believed "the newest sales sit on page one", so its freshness
+# pass (pages 1-3 of every maker) and its daily top-up (pages 1-25) re-read the
+# same alphabetical first pages thirty times over: on 19 September a whole run
+# of 396 requests added NOTHING (in_db did not move once), the day's 10,000 were
+# gone by 04:23 UTC, and every maker's last four sale days sat almost empty -
+# NISSAN 18 Sep: 0 of 2,420, HONDA 17 Sep: 6 of 1,949, TOYOTA 17 Sep: 45 of 7,686.
+# It could not notice, because it steered by the ingest's `written`, which
+# counts re-read rows as well as new ones.
+#
+# And it is why TOYOTA stopped at "PRIUS". One query is served only to about
+# 200,000 results; TOYOTA's unbounded list reached PRIUS and ended, so every
+# TOYOTA sale day in the portal holds its models "86" to "PRIUS" and nothing
+# after - RAV4, SIENTA, VOXY, YARIS are missing from all of them (~179,000 rows).
+#
+# So now: COMPARE COUNTS, and read only what is short.
+#   * The portal's counts per maker and sale day come from the ingest (?have=).
+#   * For a maker and a date window, page ONE from the source carries the total.
+#     Equal or more on our side - the window is complete, move on.
+#   * Short and small (READ_ALL pages or fewer) - read it.
+#   * Short and big - split it into single sale days, each asked the same way.
+#   * A day is read starting where our rows run out (`ours // 20`): the rows the
+#     portal holds for a day are nearly always its A-to-Z beginning - for TOYOTA
+#     exactly the "86".."PRIUS" part - so the missing ones follow them. If the
+#     day is still short at the end, the pages before the start are read too,
+#     BACKWARDS from the start: whatever was missed is most likely just behind it.
+#   * Past windows found complete are remembered (`done`), so they cost nothing
+#     afterwards; a window read to the end and still short is remembered too
+#     (`short`) and not read again at that size.
+#
+# Two passes, the newest first:
+#   RECENT   the last RECENT_DAYS sale days of every maker, every RECENT_EVERY.
+#            While Japan's halls are selling (09:00-18:00 JST) today's list is
+#            half-written, so it joins at 18:00 JST instead of being read twice.
+#   HISTORY  everything older, back HISTORY_DAYS (the source keeps about 93),
+#            a month at a time. It stops when only RESERVE requests of the day
+#            are left, so the recent check always has something to spend.
+RECENT_DAYS  = 5
+RECENT_EVERY = 90 * 60
+HISTORY_DAYS = 88
+READ_ALL     = 30
+RESERVE      = int(os.environ.get('AAA_RESERVE', '2000'))
+# How short a window may stay without the pages before the start being read
+# again: five rows for settled days (a source row that shares hall, day and lot
+# with another is one row here, so a day can be one or two short for good). The
+# newest days, which the source can still be adding to, wait for 2% - a late
+# hall adds rows all through the A-Z list, and reading a 7,000-row day again for
+# a handful would eat the day; the day is looked at once more when it settles.
+SLACK        = 5
+RECENT_SLACK = 0.02
+JST          = datetime.timedelta(hours=9)
 
 
 def today_utc():
@@ -143,12 +132,10 @@ ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode 
 
 class Blocked(Exception):
     """The source refused us. Everything stops until a person looks."""
-    pass
 
 
 class Spent(Exception):
     """The allowance is used up. Not an error - the job simply stops here."""
-    pass
 
 
 class Door(Blocked):
@@ -160,26 +147,41 @@ class Door(Blocked):
     (another machine) four hours later signed in and worked all morning. A 403
     AFTER signing in is still a plain Blocked and still stops everything.
     """
-    pass
+
+
+class Stop(Exception):
+    """This run's time is up, or another reader has called a halt."""
+
+
+class Reserve(Exception):
+    """History has had its share of today; the rest is kept for the newest days."""
+
+
+class Fatal(Exception):
+    """Something no retry will fix (e.g. the portal is an older ingest)."""
 
 
 # How many runs in a row may be turned away at the door before the job stops
 # asking and says so out loud (a failed run = an e-mail to the owner).
 DOOR_LIMIT = 4
+# After a refusal once signed in (or a fault no retry fixes) the job fails ONE
+# run - one e-mail - and then leaves the source alone this long, instead of
+# knocking again on every schedule. `--resume` ends the wait early.
+HALT_HOURS = 24
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE = os.path.join(HERE, 'aaa_fetch_state.json')
 RETRY_MARK = os.path.join(HERE, '.retry')
+# Left by a run that ended cleanly and wants the chain to go on (see fetch.yml).
+NEXT_MARK = os.path.join(HERE, '.next')
 
 
 class Throttle(object):
-    """One clock AND one purse for every worker.
+    """One clock AND one purse for every reader.
 
-    Two jobs in one object because they are the same question asked twice: may
-    this request go NOW, and may it go AT ALL. Every source request in this file
-    goes through take(), so nothing can slip past either the gap or the day's
-    allowance - which is exactly what went wrong before, when there was a gap and
-    no allowance at all.
-
-    The count is per UTC day and is carried in the state file, so a run that
-    stops for any reason cannot hand the next run a clean slate for the same day.
+    Every source request in this file goes through take(), so nothing can slip
+    past either the gap or the day's allowance. The count is per UTC day and is
+    carried in the state file, so a run that stops for any reason cannot hand
+    the next run a clean slate for the same day.
     """
 
     def __init__(self, gap, daily=0, run_cap=0):
@@ -205,7 +207,13 @@ class Throttle(object):
 
     def left(self):
         with self.lock:
+            if today_utc() != self.day:
+                return self.daily or -1
             return max(0, self.daily - self.used) if self.daily else -1
+
+    def run_left(self):
+        with self.lock:
+            return max(0, self.run_cap - self.this_run) if self.run_cap else -1
 
     def take(self):
         """Claim one request, or raise Spent. Waits out the gap before returning."""
@@ -230,6 +238,12 @@ class Throttle(object):
 
 
 THROTTLE = Throttle(GLOBAL_MIN_GAP, DAILY_BUDGET, RUN_LIMIT)
+
+
+def reserve_reached():
+    """True once history has had its share of today's allowance."""
+    left = THROTTLE.left()
+    return bool(DAILY_BUDGET) and 0 <= left <= RESERVE
 
 
 def new_opener():
@@ -261,10 +275,8 @@ def login():
 
     And the old success check was wrong: it accepted the page if the word
     "logout" appeared anywhere, and that word is in the navigation **even for a
-    guest**. So a failed sign-in sailed past it and fell over later on a missing
-    search form, which read as "the source changed its markup" when the truth was
-    "this account no longer exists". The check now looks for the two things we
-    actually need - the maker list and the search form - and nothing else.
+    guest**. The check now looks for the two things we actually need - the maker
+    list and the search form - and nothing else.
     """
     op = new_opener()
     try:
@@ -310,16 +322,24 @@ def login():
 
 
 def page(op, form, vid, pg, d1='', d2=''):
+    """One page of a maker's results, optionally inside a sale-date window.
+
+    Returns (rows, navi); navi['rows'] is the window's total. RAISES when the
+    answer is not a result list at all. The old version returned ([], {}) for
+    that, which a count-driven reader would take for "this window is empty" and
+    then file as complete for good - and a signed-out session answers exactly
+    like that.
+    """
     f = dict(form); f['vendor'] = str(vid); f['model'] = ''; f['page'] = str(max(1, pg))
-    f['list_size'] = '20'; f['tpl'] = ''; f['is_stat'] = '0'
-    # The sale-date window, when this maker is being walked a month at a time.
-    # Empty for everyone else, which is the same request as before.
+    f['list_size'] = str(PAGE_ROWS); f['tpl'] = ''; f['is_stat'] = '0'
+    # The sale-date window (YYYY-MM-DD, both ends included). `model` must stay
+    # EMPTY - "Any", which is what the box shows, returns nothing at all.
     f['stDt1'] = d1; f['stDt2'] = d2
     url = BASE + '/st?file=loader&ajx=' + str(int(time.time() * 1000)) + '0-form'
     body = aaa(op, url, urllib.parse.urlencode(f))
     mm = re.search(r"'tpl_poisk':\s*'var data\s*=\s*(\{.*?\});'", body, re.S)
     if not mm:
-        return [], {}
+        raise RuntimeError('the answer carried no result list (%d bytes)' % len(body))
     raw = mm.group(1).replace('\\"', '"').replace("\\'", "'").replace('\\/', '/')
     navi = {}
     nm = re.search(r'navi:\{(.*?)\},\s*body:', raw, re.S)
@@ -335,14 +355,18 @@ def page(op, form, vid, pg, d1='', d2=''):
     return rows, navi
 
 
+def total_of(navi):
+    """The window's size as the source reports it."""
+    v = str(navi.get('rows') or '0').strip()
+    return int(v) if v.isdigit() else 0
+
+
 def send(rows, maker):
     """POST one page to the portal. Raises with what the server actually said.
 
-    The bare json.loads() used to fail with "Expecting value: line 1 column 1",
-    which says nothing about the cause - and on 14 Sep the portal's host started
-    answering a runner with a non-JSON body, so the job retried the same page for
-    an hour learning nothing. The status and the first bytes are part of the error
-    now, so the next stall names itself."""
+    The answer's `new` is what matters: the rows the table did not have before
+    (`written` counts refreshed rows too). `new_days` splits `new` by sale day,
+    which keeps this run's own tally of the portal's counts exact."""
     data = json.dumps({'maker': maker, 'rows': rows}).encode('utf-8')
     r = urllib.request.Request(PORTAL + '?t=' + INGEST_TOKEN, data=data,
                                headers={'User-Agent': 'aaa-fetch', 'Content-Type': 'application/json'})
@@ -359,258 +383,582 @@ def send(rows, maker):
         raise RuntimeError('portal answered HTTP %s, not JSON: %s' % (status, snippet or '(empty body)'))
 
 
+def portal_have(d1, d2):
+    """What the portal holds per maker and sale day - {'TOYOTA|2026-09-18': n}.
+
+    Our own server, our own table: costs the source nothing."""
+    url = PORTAL + '?t=' + INGEST_TOKEN + '&have=days&from=%s&to=%s' % (d1, d2)
+    why = ''
+    for attempt in range(3):
+        try:
+            r = urllib.request.Request(url, headers={'User-Agent': 'aaa-fetch'})
+            with urllib.request.urlopen(r, timeout=120, context=ctx) as x:
+                j = json.loads(x.read().decode('utf-8', 'replace'))
+            if j.get('ok') and isinstance(j.get('have'), dict):
+                return dict((k.upper(), int(v)) for k, v in j['have'].items())
+            why = 'unexpected answer: %s' % str(j)[:120]
+        except Exception as e:
+            why = str(e)[:120]
+        time.sleep(10 * (attempt + 1))
+    raise RuntimeError('the portal would not say what it holds: %s' % why)
+
+
+# ------------------------------------------------------------------- dates
+def jst_now(now=None):
+    """Japan's clock - the sale dates are Japan's dates."""
+    return datetime.datetime.fromtimestamp(now or time.time(), datetime.timezone.utc) + JST
+
+
+def windows(now=None):
+    """(recent_from, recent_to, history_from, history_to) as dates."""
+    t = jst_now(now)
+    today = t.date()
+    # 09:00-18:00 JST the halls are still selling and today's list is still
+    # being written; it is read once it is finished, not every hour while it grows.
+    last = today - datetime.timedelta(days=1) if 9 <= t.hour < 18 else today
+    r_from = today - datetime.timedelta(days=RECENT_DAYS - 1)
+    h_to = r_from - datetime.timedelta(days=1)
+    h_from = today - datetime.timedelta(days=HISTORY_DAYS)
+    return r_from, last, h_from, h_to
+
+
+def next_change(now=None):
+    """Seconds until the recent window next moves (00:00, 09:00, 18:00 JST)."""
+    t = jst_now(now)
+    for h in (9, 18, 24):
+        if t.hour < h:
+            edge = t.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(hours=h)
+            return (edge - t).total_seconds()
+    return 3600.0
+
+
+def month_chunks(a, b):
+    """[a, b] cut at month ends, newest first."""
+    out = []
+    end = b
+    while end >= a:
+        first = end.replace(day=1)
+        out.append((max(first, a), end))
+        end = first - datetime.timedelta(days=1)
+    return out
+
+
+def days_newest(a, b):
+    d = b
+    while d >= a:
+        yield d
+        d -= datetime.timedelta(days=1)
+
+
+def iso(d):
+    return d.isoformat() if hasattr(d, 'isoformat') else str(d)
+
+
+def as_date(s):
+    return s if isinstance(s, datetime.date) else datetime.date.fromisoformat(str(s))
+
+
+# -------------------------------------------------------------------- state
+OLD_KEYS = ('mIdx', 'page', 'sweeps', 'fIdx', 'fPage', 'fresh_at', 'w', 'totals')
+
+
 def load_state():
+    s = {}
     if os.path.exists(STATE):
         try:
-            return json.load(io.open(STATE, encoding='utf-8'))
+            s = json.load(io.open(STATE, encoding='utf-8'))
         except Exception:
-            pass
-    return {'mIdx': 0, 'page': 1, 'sweeps': 0, 'sent': 0, 'totals': {},
-            'fIdx': None, 'fPage': 1, 'fresh_at': 0}
+            s = {}
+    # The page cursors of the old blind walk mean nothing to a count-driven
+    # reader; carrying them would only make the file lie about what it does.
+    for k in OLD_KEYS:
+        s.pop(k, None)
+    for k in ('done', 'short', 'rshort', 'later'):
+        if not isinstance(s.get(k), dict):
+            s[k] = {}
+    s.setdefault('sent', 0)
+    s.setdefault('added', 0)
+    return s
 
 
 def save_state(s):
-    # The purse is written with the cursors, every time, so however a run ends
-    # the next one knows what today has already cost.
+    # The purse is written with everything else, every time, so however a run
+    # ends the next one knows what today has already cost.
     s['budget'] = THROTTLE.snapshot()
-    io.open(STATE, 'w', encoding='utf-8').write(json.dumps(s))
+    tmp = STATE + '.tmp'
+    io.open(tmp, 'w', encoding='utf-8').write(json.dumps(s, sort_keys=True))
+    os.replace(tmp, STATE)
 
 
-def fresh_cursor():
-    return {'mIdx': 0, 'page': 1, 'sIdx': 0, 'dry': 0, 'won': 0,
-            'fIdx': None, 'fPage': 1, 'fresh_at': 0, 'sweeps': 0}
+def prune(s, r_from, h_from):
+    """Forget windows the source no longer keeps, and recent notes that have aged."""
+    old = iso(h_from - datetime.timedelta(days=7))
+    for k in ('done', 'short'):
+        for key in [x for x in s[k] if x.split('|')[-1] < old]:
+            del s[k][key]
+    for key in [x for x in s['rshort'] if x.split('|')[1] < iso(r_from)]:
+        del s['rshort'][key]
+    for key in [x for x, t in s['later'].items() if time.time() - t >= 86400]:
+        del s['later'][key]
 
 
-def worker(wid, my_ids, s, lock, a, began, stop):
-    """One worker: its own login, its own slice of makers, its own cursor.
+# ------------------------------------------------------------------- ledger
+class Ledger(object):
+    """The portal's count per maker and sale day - kept current as pages go in."""
 
-    Workers never share a maker, so two of them can never ask for the same page,
-    and the state file keeps a cursor each. Everything that IS shared - the row
-    totals, the sent count, writing the file - goes through `lock`. The source is
-    protected by THROTTLE, which all workers obey.
+    def __init__(self, have):
+        self.lock = threading.Lock()
+        self.have = dict(have)
 
-    Each worker does the same two jobs as before over its own slice:
+    def count(self, name, d1, d2):
+        a, b = as_date(d1), as_date(d2)
+        n = 0
+        with self.lock:
+            while a <= b:
+                n += int(self.have.get('%s|%s' % (name, a.isoformat()), 0))
+                a += datetime.timedelta(days=1)
+        return n
 
-      FRESH    the first FRESH_PAGES pages of every maker it owns. The newest
-               sales sit on page one, so this is what keeps the portal current -
-               without it nothing but TOYOTA would update for weeks, because the
-               backfill is still inside TOYOTA's 18,920 pages.
-      BACKFILL the deep cursor, one page at a time, filling in the history.
-    """
-    tag = 'w%d' % wid
-    try:
-        op, form, makers = login()
-    except Blocked as e:
-        # Seconds after the main sign-in worked from this same machine, so this
-        # is a real refusal, not a stray address: everybody stops.
-        print('[%s] BLOCKED at sign-in: %s -- stopping every worker.' % (tag, e), flush=True)
-        with lock: save_state(s)
-        stop.set()
-        return
-    except Exception as e:
-        print('[%s] login failed: %s' % (tag, str(e)[:80]), flush=True)
-        return
-    with lock:
-        c = s['w'].setdefault(str(wid), fresh_cursor())
-    print('[%s] %d makers, resume maker#%d page %d' % (tag, len(my_ids), c['mIdx'], c['page']), flush=True)
+    def add(self, name, per_day):
+        with self.lock:
+            for d, c in (per_day or {}).items():
+                k = '%s|%s' % (name, d)
+                self.have[k] = int(self.have.get(k, 0)) + int(c)
 
-    stale = 0
-    while not stop.is_set():
-        if a.max_seconds and time.time() - began > a.max_seconds:
-            break
-        if c['fIdx'] is None and time.time() - float(c.get('fresh_at', 0)) > FRESH_EVERY:
-            c['fIdx'] = 0; c['fPage'] = 1
-            print('[%s] ---- fresh pass over its makers ----' % tag, flush=True)
-        fresh = c['fIdx'] is not None
-        if fresh and c['fIdx'] >= len(my_ids):
-            c['fresh_at'] = time.time(); c['fIdx'] = None
-            with lock: save_state(s)
-            print('[%s] ---- fresh pass done ----' % tag, flush=True)
-            continue
-        if not fresh and c['mIdx'] >= len(my_ids):
-            c['sweeps'] += 1; c['mIdx'] = 0; c['page'] = 1; c['sIdx'] = 0
-            won = int(c.get('won', 0) or 0)
-            c['won'] = 0
-            with lock: save_state(s)
-            print('[%s] ==== finished its makers (sweep %d, %s new this pass) ===='
-                  % (tag, c['sweeps'], format(won, ',')), flush=True)
-            if a.once:
-                break
-            # A worker that went all the way round its own makers and found
-            # NOTHING has nothing left to fetch. Going round again would spend
-            # the day's allowance on pages we already hold, while another worker
-            # still has a hundred thousand rows in front of it. So it stands
-            # aside for the rest of this run; the next run starts it fresh, and
-            # the freshness pass still brings its new sales in.
-            if won == 0 and c['sweeps'] > 1:
-                print('[%s] nothing new in a whole pass - leaving the rest of the '
-                      'allowance to the others' % tag, flush=True)
-                return
-            continue
+    def size(self, name):
+        p = name + '|'
+        with self.lock:
+            return sum(v for k, v in self.have.items() if k.startswith(p))
 
-        vid = my_ids[c['fIdx'] if fresh else c['mIdx']]
-        name = makers.get(vid, vid)
-        pg = c['fPage'] if fresh else c['page']
-        # Which slice of this maker we are on. A maker under the cap has one
-        # slice - the whole thing - so nothing changes for almost all of them.
-        with lock:
-            known = int(s['totals'].get(vid, 0) or 0)
-        parts = [('', '')] if fresh else slices_for(known)
-        si = int(c.get('sIdx', 0) or 0)
-        if si >= len(parts):
-            c['sIdx'] = 0; c['dry'] = 0; c['page'] = 1
-            c['mIdx'] += 1
-            with lock: save_state(s)
-            continue
-        d1, d2 = parts[si]
 
-        try:
-            rows, navi = page(op, form, vid, pg, d1, d2)
-        except Blocked as e:
-            print('[%s] BLOCKED: %s -- the source is refusing us. Stopping every worker.' % (tag, e), flush=True)
-            with lock: save_state(s)
-            stop.set()
+# ---------------------------------------------------------------------- job
+class Job(object):
+    """What the readers of one run share: the task list, the state, the tally."""
+
+    def __init__(self, s, names, ledger, a, began, tally):
+        self.s, self.names, self.ledger, self.a, self.began = s, names, ledger, a, began
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.halted = None
+        self.blocked = False
+        self.fatal = False
+        self.history_off = False
+        self.tasks, self.ti = [], 0
+        self.busy = {}          # reader id -> when it took the window it is on
+        self.failed = set()     # windows that raised this round - not retried in this run
+        self.bad_streak = 0     # windows in a row that failed; three stop the run
+        self.doubts = 0         # fresh sign-ins spent on doubtful "none" answers
+        # Shared by every round of the run: rows the portal did not have, and
+        # source pages read (sign-ins not included).
+        self.tally = tally
+        self.dirty = 0
+
+    def say(self, msg):
+        print(msg, flush=True)
+
+    def saw(self, makers):
+        with self.lock:
+            self.s['makers'] = dict(makers)
+            for k, v in makers.items():
+                self.names.setdefault(k, v)
+
+    def guard(self, settled):
+        if self.stop.is_set():
+            raise Stop()
+        if self.a.max_seconds and time.time() - self.began > self.a.max_seconds:
+            raise Stop()
+        if settled and (self.history_off or reserve_reached()):
+            raise Reserve()
+
+    def take(self):
+        with self.lock:
+            while self.ti < len(self.tasks):
+                t = self.tasks[self.ti]
+                self.ti += 1
+                if t[0] == 'H' and self.history_off:
+                    continue
+                return t
+            return None
+
+    def give_back(self, t):
+        with self.lock:
+            self.ti -= 1
+            self.tasks[self.ti] = t
+
+    def may_doubt(self):
+        """At most five fresh sign-ins a round for a doubtful "none" (20 requests):
+        past that, a doubtful window is simply looked at again tomorrow."""
+        with self.lock:
+            if self.doubts >= 5:
+                return False
+            self.doubts += 1
+            return True
+
+    def pending(self):
+        """Windows nobody has taken yet (history ones only while history may run)."""
+        with self.lock:
+            return any(t[0] == 'R' or not self.history_off for t in self.tasks[self.ti:])
+
+    def long_busy(self, secs):
+        with self.lock:
+            return any(time.time() - t0 >= secs for t0 in self.busy.values())
+
+    def halt(self, why, blocked=False, fatal=False):
+        with self.lock:
+            if self.halted is None:
+                self.halted = why
+            self.blocked = self.blocked or blocked
+            self.fatal = self.fatal or fatal
+            save_state(self.s)
+        self.stop.set()
+
+    def took(self, name, res):
+        with self.lock:
+            k = int(res.get('new') or 0)
+            self.tally['new'] += k
+            self.s['added'] = int(self.s.get('added', 0)) + k
+            self.s['sent'] = int(self.s.get('sent', 0)) + int(res.get('written') or 0)
+        self.ledger.add(name.upper(), res.get('new_days') or {})
+
+    def counted(self):
+        with self.lock:
+            self.tally['pages'] += 1
+
+    def known(self, key, ours):
+        """What is already known of a settled window: 'done', 'short', 'unsure'
+        (a doubtful answer, looked at again after a day) - or None."""
+        with self.lock:
+            d = self.s['done'].get(key)
+            if d is not None and ours >= d:
+                return 'done'
+            if key in self.s['short']:
+                return 'short'
+            t = self.s['later'].get(key)
+            if t is not None and time.time() - t < 86400:
+                return 'unsure'
+            return None
+
+    def rshort(self, key):
+        with self.lock:
+            return self.s['rshort'].get(key)
+
+    def mark(self, key, kind, n):
+        with self.lock:
+            for k in ('done', 'short', 'rshort', 'later'):
+                if k != kind:
+                    self.s[k].pop(key, None)
+            self.s[kind][key] = int(n)
+            self.dirty += 1
+            if self.dirty >= 10:
+                save_state(self.s)
+                self.dirty = 0
+
+    def finished(self, task):
+        """A recent task that ran to its end comes off the pass's list."""
+        with self.lock:
+            self.bad_streak = 0
+        if task[0] != 'R':
             return
-        except Spent as e:
-            # Not a fault: the allowance is simply used up. The cursors keep
-            # their place, so the next run carries on from here.
-            print('[%s] %s. Stopping - the rest waits for the next run.' % (tag, e), flush=True)
-            with lock: save_state(s)
-            stop.set()
-            return
-        except Exception as e:
-            print('[%s] read error %s (%s p%d) - relogin in 5s' % (tag, str(e)[:60], name, pg), flush=True)
-            time.sleep(5)
+        with self.lock:
+            rp = self.s.get('recent') or {}
+            left = rp.get('left') or []
+            if task[1] in left:
+                left.remove(task[1])
+            if not left and rp:
+                self.say('---- the newest sale days are checked for every maker (%s .. %s) ----'
+                         % tuple(rp.get('window', '|').split('|')))
+            save_state(self.s)
+
+
+# ------------------------------------------------------------------- reader
+class Reader(object):
+    """One signed-in session and the reading it does. One per worker."""
+
+    def __init__(self, tag, job, signed=None):
+        self.tag, self.job = tag, job
+        self.op, self.form, makers = signed or login()
+        job.saw(makers)
+
+    def looks_ours(self, navi):
+        """Is this empty answer marked the way answers WITH rows are for us?
+
+        A lapsed session answers "nothing here" too, and filing a full window as
+        empty for good would lose it. So an empty answer is trusted only when it
+        carries the same `is_user` mark our answers with rows carry (remembered
+        in the state across runs); anything else is only noted for a day."""
+        mark = self.job.s.get('member')
+        return mark is not None and navi.get('is_user', '') == mark
+
+    def ask(self, vid, pg, d1, d2, settled, want=False):
+        """One page from the source, with a fresh sign-in after a bad answer.
+
+        `want`: the window's own count says this page has rows. An empty one is
+        then a bad answer, not the end of the list - taking it for the end would
+        file a half-read day as read."""
+        for attempt in range(3):
+            self.job.guard(settled)
             try:
-                op, form, makers = login()
-            except Blocked as e2:
-                print('[%s] BLOCKED at relogin: %s -- stopping every worker.' % (tag, e2), flush=True)
-                with lock: save_state(s)
-                stop.set()
-                return
-            except Exception as e2:
-                print('[%s] relogin failed: %s' % (tag, str(e2)[:60]), flush=True); time.sleep(30)
-            continue
+                rows, navi = page(self.op, self.form, vid, pg, iso(d1), iso(d2))
+                self.job.counted()
+                if want and not rows:
+                    raise RuntimeError('page %d came back empty' % pg)
+                if rows:
+                    if total_of(navi) < len(rows):
+                        raise RuntimeError('an answer with rows but no total')
+                    self.job.s['member'] = navi.get('is_user', '')
+                return rows, navi
+            except (Blocked, Spent):
+                raise
+            except Exception as e:
+                self.relogin('bad answer: %s (%s p%d %s..%s)'
+                             % (str(e)[:80], self.job.names.get(vid, vid), pg, iso(d1), iso(d2)))
+        raise RuntimeError('three bad answers in a row')
 
-        total = int(navi.get('rows', 0) or 0)
-        with lock:
-            # Only an UNBOUNDED answer says how big the maker is. A month's count
-            # would otherwise overwrite it and the maker would stop looking big
-            # enough to need splitting at all.
-            if total and not d1:
-                s['totals'][vid] = total
-            elif not total and vid in s['totals'] and not d1:
-                total = int(s['totals'][vid])
-        last = -(-total // 20) if total > 0 else 0
+    def relogin(self, why):
+        self.job.say('[%s] %s - signing in again' % (self.tag, why))
+        time.sleep(5)
+        try:
+            self.op, self.form, makers = login()
+        except (Blocked, Spent):
+            raise           # a refusal here is a real refusal: everyone stops
+        except Exception as e:
+            # Signed in once this run and cannot any more - the account, or the
+            # page, has changed. Retrying would only spend requests.
+            raise Fatal('could not sign in again: %s' % str(e)[:100])
+        self.job.saw(makers)
 
-        # A cursor can outrun the slice it is in - the maker was split into
-        # months after this cursor was already fourteen thousand pages deep, and
-        # a month is only a few hundred. Start the slice properly instead of
-        # letting the advance rule skip straight past it.
-        if not fresh and last > 0 and pg > last:
-            print('[%s] %-16s%s | cursor was past the end (p%d of %d) - starting this part again'
-                  % (tag, name, (' ' + d1[:7] if d1 else ''), pg, last), flush=True)
-            c['page'] = 1; c['dry'] = 0
-            with lock: save_state(s)
-            continue
-
-        res = {}
-        if rows:
+    def put(self, rows, name):
+        """Forward one page; returns how many of its rows the portal did not have."""
+        if not rows:
+            return 0
+        for attempt in range(1, 9):
             try:
                 res = send(rows, name)
-                with lock:
-                    s['sent'] = int(s.get('sent', 0)) + res.get('written', 0)
-                stale = 0
-                # Pages in a row that told us nothing we did not already have.
-                if not fresh:
-                    c['dry'] = 0 if res.get('written', 0) > 0 else int(c.get('dry', 0) or 0) + 1
-                    # What this whole pass has actually been worth, so a worker
-                    # with nothing left to find can stand aside (see below).
-                    c['won'] = int(c.get('won', 0) or 0) + int(res.get('written', 0) or 0)
+                if not res.get('ok', False):
+                    raise RuntimeError('portal said: %s' % str(res)[:160])
+                if 'new' not in res:
+                    raise Fatal('the portal is an older ingest - it does not say which rows are new')
+                self.job.took(name, res)
+                return int(res.get('new') or 0)
+            except Fatal:
+                raise
             except Exception as e:
-                # One page must never hold a worker: back off, then skip it.
-                stale += 1
-                print('[%s] ingest error (try %d) %s (%s p%d)' % (tag, stale, str(e)[:160], name, pg), flush=True)
-                if stale >= 8:
-                    print('[%s]   giving up on %s p%d for now - moving on' % (tag, name, pg), flush=True)
-                    stale = 0
-                    if fresh: c['fPage'] += 1
-                    else: c['page'] += 1
-                    with lock: save_state(s)
-                    continue
-                time.sleep(min(60, 5 * stale)); continue
+                # One page must never hold a reader: back off, then let it go.
+                self.job.say('[%s] ingest error (try %d) %s' % (self.tag, attempt, str(e)[:160]))
+                time.sleep(min(60, 5 * attempt))
+        self.job.say('[%s]   giving up on that page for now - its window stays short and '
+                     'is read again later' % self.tag)
+        return 0
 
-        if fresh:
-            if (last > 0 and pg >= min(last, FRESH_PAGES)) or pg >= FRESH_PAGES or not rows:
-                c['fIdx'] += 1; c['fPage'] = 1
-            else:
-                c['fPage'] += 1
+    def fill(self, vid, d1, d2, settled, retried=False):
+        """Make the portal's count for [d1, d2] match the source's, reading as little as possible.
+
+        Returns 'done', 'short' or 'unsure'. A window split into days is filed
+        only when every day gave a straight answer; a doubtful day leaves the
+        whole window to be looked at again in a day, never filed short for good."""
+        job = self.job
+        name = job.names[vid]
+        up = name.upper()
+        key = '%s|%s|%s' % (vid, iso(d1), iso(d2))
+        ours = job.ledger.count(up, d1, d2)
+        if settled:
+            known = job.known(key, ours)
+            if known:
+                return known
+        rows, navi = self.ask(vid, 1, d1, d2, settled)
+        n = total_of(navi)
+        self.put(rows, name)
+        ours = job.ledger.count(up, d1, d2)
+        if ours >= n:
+            if n > 0:
+                if settled:
+                    job.mark(key, 'done', n)
+                return 'done'
+            if (ours > 0 or not self.looks_ours(navi)) and not retried and job.may_doubt():
+                # "None" for days the source still keeps and we hold rows for - or
+                # a "none" not marked the way our answers are - is far more likely
+                # a lapsed session than the truth. Sign in afresh and ask again.
+                self.relogin('the source said none (%s %s..%s, we hold %s)'
+                             % (name, iso(d1), iso(d2), format(ours, ',')))
+                return self.fill(vid, d1, d2, settled, retried=True)
+            if ours == 0 and self.looks_ours(navi):
+                if settled:
+                    job.mark(key, 'done', 0)     # empty there and here, answered like ours
+                return 'done'
+            if settled:
+                job.mark(key, 'later', int(time.time()))
+            return 'unsure'
+        if not settled and job.rshort(key) == n:
+            return 'short'      # read to the end at exactly this size already
+        last = -(-n // PAGE_ROWS)
+        if last > READ_ALL and d1 != d2:
+            doubt = False
+            for d in days_newest(d1, d2):
+                doubt = (self.fill(vid, d, d, settled) == 'unsure') or doubt
+            ours = job.ledger.count(up, d1, d2)
+            if ours >= n:
+                if settled:
+                    job.mark(key, 'done', n)
+                return 'done'
+            if doubt:
+                if settled:
+                    job.mark(key, 'later', int(time.time()))
+                return 'unsure'
+            job.mark(key, 'short' if settled else 'rshort', n)
+            return 'short'
+        return self.read(vid, name, key, d1, d2, n, settled)
+
+    def read(self, vid, name, key, d1, d2, n, settled):
+        """Read one short window, starting where our rows run out."""
+        job = self.job
+        up = name.upper()
+        last = -(-n // PAGE_ROWS)
+        before = job.ledger.count(up, d1, d2)
+        start = max(2, min(last, before // PAGE_ROWS))
+        slack = SLACK if settled else max(SLACK, int(n * RECENT_SLACK))
+        asked = [1]
+
+        def sweep(pages):
+            for pg in pages:
+                rows, navi = self.ask(vid, pg, d1, d2, settled, want=True)
+                asked[0] += 1
+                self.put(rows, name)
+                if job.ledger.count(up, d1, d2) >= n:
+                    return True
+            return False
+
+        whole = sweep(range(start, last + 1))
+        ours = job.ledger.count(up, d1, d2)
+        if not whole and start > 2 and n - ours > slack:
+            whole = sweep(range(start - 1, 1, -1))
+            ours = job.ledger.count(up, d1, d2)
+        if ours >= n:
+            if settled:
+                job.mark(key, 'done', n)
         else:
-            # A worker that has been all the way round ITS OWN makers does not
-            # need to walk them deeply again - the newest sales sit on page one.
-            # This used to be decided for everybody at once, from the SLOWEST
-            # worker, so two workers that had already finished kept re-reading
-            # ground they had covered: on 17 September 2026 a run read 8,784 rows
-            # to find 194 new ones. The sweep belongs to each worker, so the
-            # decision does too - and with a daily allowance now, a request spent
-            # on a page we already have is a request the backfill does not get.
-            if int(c.get('dry', 0) or 0) >= DRY_PAGES:
-                print('[%s] %-16s%s p%-5d | %d pages with nothing new - moving on'
-                      % (tag, name, (' ' + d1[:7] if d1 else ''), pg, DRY_PAGES), flush=True)
-                c['dry'] = 0; c['page'] = 1
-                if len(parts) > 1:
-                    c['sIdx'] = si + 1      # try the next month of this maker
-                else:
-                    c['sIdx'] = 0; c['mIdx'] += 1
-                with lock: save_state(s)
-                time.sleep(GAP)
-                continue
-            myrecent = a.recent
-            if myrecent == 0 and not a.full and int(c.get('sweeps', 0) or 0) >= 1:
-                myrecent = RECENT_PAGES
-            cap = myrecent if myrecent > 0 else last
-            if (last > 0 and pg >= min(last, cap if cap else last)) or (not rows and pg >= 1):
-                print('[%s] %-16s%-9s p%-5d of %-6d | %s rows at source | in_db %s'
-                      % (tag, name, (' ' + d1[:7] if d1 else ''), pg, last, format(total, ','),
-                         format(res.get('in_db', 0), ',') if rows else '-'), flush=True)
-                c['page'] = 1; c['dry'] = 0
-                if len(parts) > 1 and si + 1 < len(parts):
-                    c['sIdx'] = si + 1      # the next month of the same maker
-                else:
-                    c['sIdx'] = 0; c['mIdx'] += 1
-            else:
-                c['page'] += 1
-        with lock: save_state(s)
-        time.sleep(GAP)
+            job.mark(key, 'short' if settled else 'rshort', n)
+        span = iso(d1) if d1 == d2 else '%s..%s' % (iso(d1)[5:], iso(d2)[5:])
+        job.say('[%s] %-14s %-12s | source %6s | had %6s -> %6s | %d pages%s'
+                % (self.tag, name, span, format(n, ','), format(before, ','), format(ours, ','),
+                   asked[0], '' if ours >= n else ' | still %s short' % format(n - ours, ',')))
+        return 'done' if ours >= n else 'short'
 
 
-def run():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--recent', type=int, default=0)
-    ap.add_argument('--maker', default='')
-    ap.add_argument('--max-seconds', type=int, default=0)
-    ap.add_argument('--once', action='store_true')
-    ap.add_argument('--full', action='store_true', help='force a whole sweep even after the first')
-    ap.add_argument('--workers', type=int, default=WORKERS)
-    a = ap.parse_args()
+def worker(wid, job, sessions):
+    tag = 'w%d' % wid
+    while not job.stop.is_set():
+        task = job.take()
+        if task is None:
+            return
+        rd = sessions.get(wid)
+        if rd is None:
+            try:
+                rd = Reader(tag, job)
+                sessions[wid] = rd
+            except Blocked as e:
+                # Moments after the run's first sign-in worked from this same
+                # machine, so this is a real refusal, not a stray address.
+                job.say('[%s] BLOCKED at sign-in: %s -- stopping every reader.' % (tag, e))
+                job.halt('blocked at sign-in', blocked=True)
+                return
+            except Spent as e:
+                job.say('[%s] %s.' % (tag, e))
+                job.halt(str(e))
+                return
+            except Exception as e:
+                job.say('[%s] sign-in failed: %s - leaving the work to the others' % (tag, str(e)[:80]))
+                job.give_back(task)
+                return
+        kind, vid, d1, d2 = task
+        with job.lock:
+            job.busy[wid] = time.time()
+        try:
+            rd.fill(vid, d1, d2, kind == 'H')
+            job.finished(task)
+        except Spent as e:
+            job.say('[%s] %s. Stopping - the rest waits for the next run.' % (tag, e))
+            job.halt(str(e))
+            return
+        except Blocked as e:
+            job.say('[%s] BLOCKED: %s -- the source is refusing us. Stopping every reader.' % (tag, e))
+            job.halt('blocked', blocked=True)
+            return
+        except Reserve:
+            if not job.history_off:
+                job.history_off = True
+                job.say('[%s] history has had its share of today (%s requests are kept for the '
+                        'newest days) - it carries on tomorrow' % (tag, format(RESERVE, ',')))
+        except Stop:
+            return
+        except Fatal as e:
+            job.say('[%s] %s -- stopping.' % (tag, e))
+            job.halt(str(e), fatal=True)
+            return
+        except Exception as e:
+            with job.lock:
+                job.failed.add(task)
+                job.bad_streak += 1
+                streak = job.bad_streak
+            job.say('[%s] %s %s..%s set aside for this run: %s'
+                    % (tag, job.names.get(vid, vid), iso(d1), iso(d2), str(e)[:100]))
+            if streak >= 3:
+                # Something systematic (the page changed, the account can no
+                # longer see data). Going on would spend the day on nothing.
+                job.say('[%s] three windows in a row failed -- stopping so a person looks.' % tag)
+                job.halt('three windows in a row failed', fatal=True)
+                return
+        finally:
+            with job.lock:
+                job.busy.pop(wid, None)
 
-    if not (USER and PW and INGEST_TOKEN):
-        sys.exit('AAA_USER, AAA_PASS and AAA_INGEST_TOKEN must be set in the environment.')
 
-    began = time.time()
+# --------------------------------------------------------------------- plan
+def plan(job, now, only=''):
+    """The windows worth a request right now: recent ones first, then history."""
+    s = job.s
+    r_from, r_to, h_from, h_to = windows(now)
+    vids = sorted(job.names, key=lambda v: (-job.ledger.size(job.names[v].upper()), str(v)))
+    if only:
+        vids = [v for v in vids if str(v) == str(only)]
+    tasks = []
 
-    # The purse is read before anything is spent, the login included - otherwise
-    # a day whose allowance is already gone would still pay for four requests
-    # every hour just to find that out.
-    s = load_state()
-    THROTTLE.load(s.get('budget'))
+    if only:
+        # Trying one maker by hand must not disturb the shared recent pass.
+        tasks += [('R', v, r_from, r_to) for v in vids]
+    else:
+        win = '%s|%s' % (iso(r_from), iso(r_to))
+        rp = s.get('recent') or {}
+        if rp.get('window') != win or (not rp.get('left') and now - float(rp.get('at', 0)) >= RECENT_EVERY):
+            rp = {'window': win, 'at': now, 'left': list(vids)}
+            s['recent'] = rp
+        left = set(rp.get('left') or [])
+        tasks += [('R', v, r_from, r_to) for v in vids if v in left]
+
+    # History waits while today's reserve is all that is left.
+    if not reserve_reached():
+        for a, b in month_chunks(h_from, h_to):
+            for v in vids:
+                key = '%s|%s|%s' % (v, iso(a), iso(b))
+                if not job.known(key, job.ledger.count(job.names[v].upper(), a, b)):
+                    tasks.append(('H', v, a, b))
+    return tasks
+
+
+def seconds_to_next(s, now):
+    """How long until there is something to ask the source again."""
+    rp = s.get('recent') or {}
+    due = 0.0 if rp.get('left') else float(rp.get('at', 0)) + RECENT_EVERY - now
+    wait = min(due, next_change(now))
     if THROTTLE.left() == 0:
-        print('today has already used its %s requests. Nothing to do until tomorrow.'
-              % format(DAILY_BUDGET, ','), flush=True)
-        return
+        wait = max(wait, 86400 - (now % 86400) + 30)     # the allowance comes back at 00:00 UTC
+    return max(0.0, wait)
 
+
+# ---------------------------------------------------------------------- run
+def sign_in_first(s):
+    """The run's first sign-in, which is where a refusal at the door shows up."""
     try:
-        op, form, makers = login()      # once, just to learn the maker list
+        signed = login()
     except Door as e:
         door = int(s.get('door', 0) or 0) + 1
         s['door'] = door
@@ -620,72 +968,192 @@ def run():
             print('turned away at the door (%s). That is the address of this GitHub machine, not the '
                   'account - asking again from another machine (%d of %d).'
                   % (e, door, DOOR_LIMIT - 1), flush=True)
-            return
+            return None
         if door == DOOR_LIMIT:
             print('turned away at the door %d runs in a row (%s). Stopping loudly so a person looks.'
                   % (door, e), flush=True)
             sys.exit(1)
         print('still turned away at the door (%d runs in a row; the owner was told at %d). '
               'Trying again on the next schedule.' % (door, DOOR_LIMIT), flush=True)
-        return
+        return None
     if s.get('door'):
         print('in again after %d refusal(s) at the door' % int(s['door']), flush=True)
     s['door'] = 0
-    ids = list(makers.keys())
-    if a.maker:
-        ids = [i for i in ids if str(i) == str(a.maker)]
-    if not ids:
-        sys.exit('no makers to work on')
+    return signed
 
-    s.setdefault('totals', {})
-    s.setdefault('sent', 0)
-    if 'w' not in s:
-        # Carry an older single-cursor state over: the maker it had reached keeps
-        # its page, and every other worker starts at the top of its own slice.
-        s['w'] = {}
-        old_i = int(s.get('mIdx', 0) or 0)
-        old_vid = ids[old_i] if 0 <= old_i < len(ids) else None
-        old_page = int(s.get('page', 1) or 1)
-        print('carrying older progress over: maker %s page %d'
-              % (makers.get(old_vid, '-'), old_page), flush=True)
-        for wid in range(max(1, a.workers)):
-            c = fresh_cursor()
-            slice_ids = ids[wid::max(1, a.workers)]
-            if old_vid in slice_ids:
-                c['mIdx'] = slice_ids.index(old_vid); c['page'] = old_page
-            s['w'][str(wid)] = c
-        save_state(s)
 
-    nw = max(1, min(a.workers, len(ids)))
-    swept = min((int(c.get('sweeps', 0) or 0) for c in s['w'].values()), default=0)
-    if a.recent == 0 and not a.full and swept >= 1:
-        a.recent = RECENT_PAGES     # the history is in; keep later runs light
-    print('login ok | %d makers | %d workers | gap %.1fs | today %s of %s requests used, '
-          '%s per run | sent so far %s'
-          % (len(ids), nw, GLOBAL_MIN_GAP,
-             format(THROTTLE.snapshot()['used'], ','), format(DAILY_BUDGET, ','),
-             format(RUN_LIMIT, ','), format(int(s.get('sent', 0)), ',')), flush=True)
+def run():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--maker', default='')
+    ap.add_argument('--max-seconds', type=int, default=0)
+    ap.add_argument('--workers', type=int, default=WORKERS)
+    ap.add_argument('--once', action='store_true')
+    ap.add_argument('--plan', action='store_true')
+    ap.add_argument('--resume', action='store_true', help='end a stop after a refusal, once a person has looked')
+    a = ap.parse_args()
 
-    lock = threading.Lock()
-    stop = threading.Event()
-    threads = []
-    for wid in range(nw):
-        t = threading.Thread(target=worker, args=(wid, ids[wid::nw], s, lock, a, began, stop),
-                             name='w%d' % wid, daemon=True)
-        t.start(); threads.append(t)
-        time.sleep(2)               # stagger the logins
-    for t in threads:
-        t.join()
-    with lock:
-        save_state(s)
+    if not INGEST_TOKEN:
+        sys.exit('AAA_INGEST_TOKEN must be set - the portal counts are behind it.')
+    if not (USER and PW) and not a.plan:
+        sys.exit('AAA_USER and AAA_PASS must be set in the environment.')
+    for mark in (NEXT_MARK, RETRY_MARK):
+        if os.path.exists(mark):
+            os.remove(mark)
 
-    done = ', '.join('w%s %d/%d makers' % (wid, c.get('mIdx', 0), len(ids[int(wid)::nw]))
-                     for wid, c in sorted(s['w'].items()))
+    began = time.time()
+    s = load_state()
+    THROTTLE.load(s.get('budget'))
+    if a.resume and s.pop('halted', None):
+        print('resumed by hand', flush=True)
+    stopped = s.get('halted')
+    if stopped and not a.plan:
+        since = time.time() - float(stopped.get('at', 0) or 0)
+        if since < HALT_HOURS * 3600:
+            print('stopped %.1f hours ago: %s. The source is left alone for %d hours after that - '
+                  'or run with --resume once a person has looked.'
+                  % (since / 3600.0, stopped.get('why', '?'), HALT_HOURS), flush=True)
+            return
+        print('%d hours since the stop (%s) - trying once more' % (HALT_HOURS, stopped.get('why', '?')), flush=True)
+        s.pop('halted', None)
+    names = dict(s.get('makers') or {})
+    tally = {'new': 0, 'pages': 0}
+    sessions = {}           # worker id -> Reader, kept for the whole run
+    first = None            # the run's first sign-in, before a Reader exists for it
+    job = None
+    halted = None
+    blocked = fatal = False
+    failed = set()
+    rounds = 0
+
+    def time_left():
+        return (a.max_seconds - (time.time() - began)) if a.max_seconds else 1e9
+
+    while time_left() > 30:
+        now = time.time()
+        r_from, r_to, h_from, h_to = windows(now)
+        prune(s, r_from, h_from)
+        tasks = []
+        if THROTTLE.left() == 0 and not a.plan:
+            if rounds == 0:
+                print("today's %s requests are spent - nothing asks the source until 00:00 UTC."
+                      % format(DAILY_BUDGET, ','), flush=True)
+        else:
+            if not names:
+                if a.plan:
+                    sys.exit('no maker list yet - it is learnt at the first sign-in')
+                first = sign_in_first(s)
+                if first is None:
+                    return
+                names = dict(first[2])
+                s['makers'] = dict(names)
+            try:
+                have = portal_have(iso(h_from), iso(r_to + datetime.timedelta(days=1)))
+            except RuntimeError as e:
+                # Without the portal's counts there is nothing to compare, and
+                # nowhere to put rows either. End quietly; the schedule tries again.
+                print('%s - ending this run without asking the source anything.' % e, flush=True)
+                save_state(s)
+                return
+            ledger = Ledger(have)
+            job = Job(s, names, ledger, a, began, tally)
+            tasks = [t for t in plan(job, now, a.maker) if t not in failed]
+
+            if a.plan:
+                r = [t for t in tasks if t[0] == 'R']
+                h = [t for t in tasks if t[0] == 'H']
+                print('recent window %s .. %s: %d makers to check | history %s .. %s: %d windows not '
+                      'yet known complete | today %s of %s requests used'
+                      % (r_from, r_to, len(r), h_from, h_to, len(h),
+                         format(THROTTLE.snapshot()['used'], ','), format(DAILY_BUDGET, ',')))
+                for t in r[:12]:
+                    print('   R %-14s %s .. %s  portal holds %s' % (names[t[1]], t[2], t[3],
+                          format(ledger.count(names[t[1]].upper(), t[2], t[3]), ',')))
+                for t in h[:40]:
+                    print('   H %-14s %s .. %s  portal holds %s' % (names[t[1]], t[2], t[3],
+                          format(ledger.count(names[t[1]].upper(), t[2], t[3]), ',')))
+                return
+
+        if tasks:
+            if 0 not in sessions:
+                if first is None:
+                    first = sign_in_first(s)
+                    if first is None:
+                        return
+                sessions[0] = Reader('w0', job, signed=first)
+            for rd in sessions.values():
+                rd.job = job
+            nr = len([t for t in tasks if t[0] == 'R'])
+            want = max(1, min(a.workers, len(tasks)))
+            print('round %d | %d recent + %d history windows | up to %d readers | gap %.1fs | today %s of %s '
+                  'used, %s per run'
+                  % (rounds + 1, nr, len(tasks) - nr, want, GLOBAL_MIN_GAP,
+                     format(THROTTLE.snapshot()['used'], ','), format(DAILY_BUDGET, ','),
+                     format(RUN_LIMIT, ',')), flush=True)
+            job.tasks = tasks
+            threads = []
+
+            def spawn():
+                t = threading.Thread(target=worker, args=(len(threads), job, sessions),
+                                     name='w%d' % len(threads), daemon=True)
+                threads.append(t)
+                t.start()
+
+            spawn()
+            last_spawn = time.time()
+            while True:
+                alive = [t for t in threads if t.is_alive()]
+                if not alive:
+                    break
+                alive[0].join(timeout=POLL)
+                if (len(threads) < want and not job.stop.is_set() and job.pending()
+                        and time.time() - last_spawn >= EXTRA_GAP and job.long_busy(EXTRA_AFTER)):
+                    spawn()
+                    last_spawn = time.time()
+            rounds += 1
+            failed |= job.failed
+            save_state(s)
+            if job.halted:
+                halted, blocked, fatal = job.halted, job.blocked, job.fatal
+                break
+            if job.ti < len(job.tasks) and not job.history_off:
+                break           # readers stopped early (time, or none could sign in) - never spin
+            if a.once:
+                break
+            continue            # look again: the answer is usually "nothing more for now"
+
+        if a.once or not a.max_seconds:
+            break
+        # Nothing to ask for now. Wait inside this run for the next check of the
+        # newest days if it comes before the run's end; otherwise end here, and
+        # the workflow starts the next run (.next) - which asks the source
+        # nothing until there is something to ask.
+        wait = seconds_to_next(s, time.time())
+        if wait > time_left() - 90:
+            time.sleep(max(0, time_left() - 60))
+            break
+        print('nothing to ask for now - next look in %d min' % (wait // 60 + 1), flush=True)
+        time.sleep(wait + 5)
+
+    save_state(s)
     snap = THROTTLE.snapshot()
-    print('stopped | rows sent all-time %s | today %s of %s requests used (%s left) | %s'
-          % (format(int(s.get('sent', 0)), ','), format(snap['used'], ','),
-             format(DAILY_BUDGET, ','), format(max(0, DAILY_BUDGET - snap['used']), ','), done),
-          flush=True)
+    print('stopped%s | this run: %s source requests, %s pages read, %s new rows (%.1f per page) | '
+          'today %s of %s used | windows known complete %s, read to the end and short %s'
+          % ((' (%s)' % halted) if halted else '',
+             format(THROTTLE.this_run, ','), format(tally['pages'], ','), format(tally['new'], ','),
+             (tally['new'] / float(tally['pages'])) if tally['pages'] else 0.0,
+             format(snap['used'], ','), format(DAILY_BUDGET, ','),
+             format(len(s['done']), ','), format(len(s['short']), ',')), flush=True)
+
+    if blocked or fatal:
+        s['halted'] = {'why': halted, 'at': time.time()}
+        save_state(s)
+        print('this run fails on purpose, so the owner hears about it once; the source is now left '
+              'alone for %d hours.' % HALT_HOURS, flush=True)
+        sys.exit(1)
+    # Ask for the next run only after a clean, full-length run. A crash, a
+    # refusal or a short test run leaves no mark, so nothing can spin.
+    if time.time() - began >= 180:
+        io.open(NEXT_MARK, 'w').write('next')
 
 
 if __name__ == '__main__':

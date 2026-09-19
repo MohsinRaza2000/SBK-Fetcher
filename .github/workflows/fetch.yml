@@ -8,33 +8,34 @@
 # The first account was closed on 16 September 2026 after this job pulled the
 # source's whole price archive, 915,048 rows, in about forty hours. The gap was
 # obeyed the entire time; there was simply no ceiling on the total. That ceiling
-# is now the thing that stops the job, and it is what makes everything below
-# safe to do.
+# is what stops the job now.
 #
-# WHY IT CHAINS ITSELF AGAIN. It was a plain cron for a few hours on 17 September
-# and GitHub fired **not one** scheduled run: the day used 1,195 of its 5,000
-# requests, and both runs that happened were started by hand. GitHub skips
-# short-interval schedules on shared runners, which is the same thing that
-# happened on 14 September. So a finished run starts the next one — but now the
-# DAY'S ALLOWANCE is what ends the chain. When the purse is empty a run signs in,
-# sees it, and stops in seconds; the elapsed-time guard then declines to
-# re-queue, and the chain rests until tomorrow. Before the allowance existed this
-# same chain ran for twenty-four hours a day, which is how forty hours took the
-# whole archive.
+# WHAT A RUN DOES (since 19 September 2026). It compares counts: the portal says
+# how many rows it holds per maker and sale day (free - our own server), page one
+# of any window at the source says how many the source has, and only windows that
+# are short get read. The newest five sale days are checked every 90 minutes; the
+# history behind them is filled until only the day's reserve is left. See the long
+# comment at the top of aaa_fetch.py for why (the source sorts by MODEL, not date,
+# so the old "newest pages first" top-up re-read the same pages thirty times).
 #
-# The cron is the belt to that braces: it restarts the chain each day. It fires
-# twice an hour because GitHub skips schedules freely - on 18 September not one
-# of the 01:07, 02:07 or 03:07 runs happened, and the day started four hours
-# late. A run on a spent day never touches the source (the allowance is read
-# before signing in), so the extra schedules cost the source nothing.
+# WHY IT CHAINS ITSELF. GitHub skips short-interval schedules on shared runners -
+# on 18 September not one of the 01:07, 02:07 or 03:07 runs happened. So a run
+# that ends cleanly leaves `.next`, and the last step starts the next run. A run
+# with nothing to ask WAITS INSIDE ITSELF (for the next check, or for 00:00 UTC
+# when the day's allowance is spent) and asks the source nothing while it waits.
+# No `.next` - a crash, a refusal, a short test run - and the chain stops; the
+# cron below is the safety net that starts it again.
 #
 # TURNED AWAY AT THE DOOR (18 September 2026, 00:00 UTC). One GitHub machine got
 # 403 on the very first page, before signing in - nothing identifies us there but
-# that machine's address, and the next machine worked all morning. aaa_fetch.py
-# now treats that as the machine's problem: the run ends quietly, leaves a
-# `.retry` mark, and the step at the bottom asks for another machine straight
-# away. Four refusals in a row fail the run on purpose, which e-mails the owner
-# once. A refusal AFTER signing in still stops everything, as it always did.
+# that machine's address. The run ends quietly, leaves `.retry`, and the last step
+# asks for another machine. Four refusals in a row fail the run on purpose, which
+# e-mails the owner once.
+#
+# REFUSED AFTER SIGNING IN - the 16 September shape. Every reader stops, the run
+# fails on purpose (one e-mail), and the source is left alone for 24 hours rather
+# than being knocked on every schedule. Start a run by hand with resume = yes to
+# end that wait once a person has looked.
 #
 # Both numbers are repository Variables — AAA_DAILY_BUDGET and AAA_RUN_LIMIT —
 # so they change without a commit, and neither should be raised without the owner.
@@ -47,9 +48,13 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: 'How long this run may fetch for (the request limit usually stops it first)'
+        description: 'How long this run may last (idle runs wait inside it)'
         required: false
         default: '1200'
+      resume:
+        description: 'yes = end the 24-hour stop after a refusal (only once a person has looked)'
+        required: false
+        default: 'no'
 
 concurrency:
   group: fetch-stats
@@ -64,14 +69,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Note the start time
-        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Fetch a chunk and forward it to the portal
+      - name: Fetch what is short and forward it to the portal
         env:
           AAA_USER: ${{ secrets.AAA_USER }}
           AAA_PASS: ${{ secrets.AAA_PASS }}
@@ -79,7 +82,7 @@ jobs:
           AAA_INGEST_URL: ${{ secrets.AAA_INGEST_URL }}
           AAA_DAILY_BUDGET: ${{ vars.AAA_DAILY_BUDGET || '10000' }}
           AAA_RUN_LIMIT: ${{ vars.AAA_RUN_LIMIT || '600' }}
-        run: python aaa_fetch.py --max-seconds ${{ github.event.inputs.seconds || '1200' }}
+        run: python aaa_fetch.py --max-seconds ${{ github.event.inputs.seconds || '1200' }} ${{ github.event.inputs.resume == 'yes' && '--resume' || '' }}
 
       - name: Save progress
         if: always()
@@ -94,22 +97,19 @@ jobs:
             echo "push retry $i"; sleep 4
           done
 
-      # Hand the baton on, unless this run did almost nothing - which is what a
-      # run looks like once the day's allowance is spent, and also what a broken
-      # run looks like. Either way it must not re-queue, or a crash would spin.
+      # Hand the baton on - only when the run asked for it (.next), or when it
+      # was turned away at the door and wants another machine (.retry).
       - name: Start the next run
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mins=$(( ( $(date +%s) - ${T0:-0} ) / 60 ))
-          echo "this run lasted ${mins} min"
           if [ -f .retry ]; then
             echo "turned away at the door - asking again from another machine in 30s"
             sleep 30
             gh workflow run fetch.yml --ref main && echo "next run queued"
-          elif [ "$mins" -ge 5 ]; then
+          elif [ -f .next ]; then
             gh workflow run fetch.yml --ref main && echo "next run queued"
           else
-            echo "under five minutes - not re-queueing (spent allowance, or a fault)"
+            echo "no .next - not re-queueing (a stop after a refusal, a fault, or a short test run); the schedule starts it again"
           fi
