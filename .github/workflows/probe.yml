@@ -1,0 +1,30 @@
+# A measuring run, started by hand only: it asks the source how big a few slices
+# are and prints them beside what the portal holds. It fetches no rows and writes
+# nothing - about two dozen requests, at the same gap as the fetch job.
+name: probe-gap
+
+on:
+  workflow_dispatch:
+    inputs:
+      ours:
+        description: 'What the portal already holds, as JSON'
+        required: true
+        default: '{}'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: measure
+        env:
+          AAA_USER: ${{ secrets.AAA_USER }}
+          AAA_PASS: ${{ secrets.AAA_PASS }}
+          AAA_INGEST_TOKEN: ${{ secrets.AAA_INGEST_TOKEN }}
+          AAA_INGEST_URL: ${{ secrets.AAA_INGEST_URL }}
+          OURS: ${{ github.event.inputs.ours }}
+        run: python probe_gap.py
