@@ -168,6 +168,16 @@ DOOR_LIMIT = 4
 # run - one e-mail - and then leaves the source alone this long, instead of
 # knocking again on every schedule. `--resume` ends the wait early.
 HALT_HOURS = 24
+
+# The portal shows staff a green or red signal for the aaajapan ID (the owner's
+# request of 24 September 2026). It can only know what this job tells it, so
+# every run - however it ends - reports how its sign-in went: see
+# report_health() and the portal's aaa-stats-ingest.php ?health=1.
+#   login: 'ok' | 'refused' (bad username or password) | 'noaccess' (signed in,
+#          but statistics are not reachable) | 'door' (this machine turned away)
+#          | '' (no sign-in this run - the allowance is spent, or a stop holds)
+HEALTH = {'login': '', 'why': ''}
+RUN = {}
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, 'aaa_fetch_state.json')
 RETRY_MARK = os.path.join(HERE, '.retry')
@@ -282,10 +292,12 @@ def login():
     try:
         aaa(op, BASE + '/st?classic')
     except Blocked as e:
+        HEALTH.update(login='door', why=str(e)[:200])
         raise Door(str(e))
     except (urllib.error.URLError, OSError) as e:
         # The source did not answer at all (down, or this machine cannot reach
         # it). Same remedy as a refusal at the door: another machine, later.
+        HEALTH.update(login='door', why=('no answer: %s' % str(e))[:200])
         raise Door('no answer: %s' % str(e)[:80])
     time.sleep(GAP)
 
@@ -294,6 +306,7 @@ def login():
     ans = aaa(op, BASE + '/m?name=login&file=xloader', creds, '/st?classic')
     q = re.search(r"'q'\s*:\s*'([^']*)'", ans)
     if q and q.group(1).strip() != '1':
+        HEALTH.update(login='refused', why=q.group(1).strip()[:200])
         raise RuntimeError('the source refused these details: %s' % q.group(1).strip())
     time.sleep(GAP)
 
@@ -315,9 +328,11 @@ def login():
                 v = re.search(r'value=(["\'])(.*?)\1', tag, re.S)
                 form[n.group(1)] = v.group(2) if v else ''
     if not mk or not form:
+        HEALTH.update(login='noaccess', why='signed in, but the statistics search is not on the page')
         raise RuntimeError('signed in, but the maker list and search form are not on '
                            'the page - the source has changed, or this account cannot '
                            'reach statistics')
+    HEALTH.update(login='ok', why='')
     return op, form, mk
 
 
@@ -401,6 +416,43 @@ def portal_have(d1, d2):
             why = str(e)[:120]
         time.sleep(10 * (attempt + 1))
     raise RuntimeError('the portal would not say what it holds: %s' % why)
+
+
+def report_health(error=''):
+    """Tell the portal how the aaajapan ID fared this run - it turns that into the
+    green or red signal staff see on the Statistics page.
+
+    Sent at the end of EVERY run, however it ended, so a silence the portal can
+    measure means GitHub stopped running this. Nothing here may break a run: a
+    report that cannot be delivered is printed and forgotten."""
+    try:
+        s = RUN.get('s') or {}
+        tally = RUN.get('tally') or {}
+        halted = s.get('halted') or {}
+        if not isinstance(halted, dict):
+            halted = {'why': str(halted), 'at': 0}
+        body = {
+            'login': HEALTH['login'],
+            'why': (HEALTH['why'] or str(error))[:200],
+            'halted': str(halted.get('why', '') or '')[:300],
+            'halted_at': int(float(halted.get('at', 0) or 0)),
+            'door': int(s.get('door', 0) or 0),
+            'spent': bool(DAILY_BUDGET) and THROTTLE.left() == 0,
+            'used': int(THROTTLE.snapshot().get('used', 0)),
+            'budget': DAILY_BUDGET,
+            'pages': int(tally.get('pages', 0)),
+            'new': int(tally.get('new', 0)),
+            'run': os.environ.get('GITHUB_RUN_ID', ''),
+        }
+        r = urllib.request.Request(PORTAL + '?t=' + INGEST_TOKEN + '&health=1',
+                                   data=json.dumps(body).encode('utf-8'),
+                                   headers={'User-Agent': 'aaa-fetch', 'Content-Type': 'application/json'})
+        with urllib.request.urlopen(r, timeout=30, context=ctx) as x:
+            ok = json.loads(x.read().decode('utf-8', 'replace')).get('ok')
+        print('ID signal to the portal: login=%s halted=%s spent=%s -> %s'
+              % (body['login'] or '-', body['halted'] or '-', body['spent'], 'kept' if ok else 'NOT kept'), flush=True)
+    except Exception as e:
+        print('ID signal not delivered (%s) - the portal turns red if this goes on' % str(e)[:120], flush=True)
 
 
 # ------------------------------------------------------------------- dates
@@ -995,6 +1047,7 @@ def run():
     if not INGEST_TOKEN:
         sys.exit('AAA_INGEST_TOKEN must be set - the portal counts are behind it.')
     if not (USER and PW) and not a.plan:
+        HEALTH.update(login='nocreds', why='AAA_USER / AAA_PASS are not set on GitHub')
         sys.exit('AAA_USER and AAA_PASS must be set in the environment.')
     for mark in (NEXT_MARK, RETRY_MARK):
         if os.path.exists(mark):
@@ -1002,6 +1055,7 @@ def run():
 
     began = time.time()
     s = load_state()
+    RUN['s'] = s                        # report_health() reads the stop and the door count from here
     THROTTLE.load(s.get('budget'))
     if a.resume and s.pop('halted', None):
         print('resumed by hand', flush=True)
@@ -1017,6 +1071,7 @@ def run():
         s.pop('halted', None)
     names = dict(s.get('makers') or {})
     tally = {'new': 0, 'pages': 0}
+    RUN['tally'] = tally
     sessions = {}           # worker id -> Reader, kept for the whole run
     first = None            # the run's first sign-in, before a Reader exists for it
     job = None
@@ -1157,4 +1212,17 @@ def run():
 
 
 if __name__ == '__main__':
-    run()
+    # However the run ends - done, stopped, refused, or an error - the portal
+    # hears how the ID fared (a --plan run signs in to nothing and says nothing).
+    failure = ''
+    try:
+        run()
+    except SystemExit as e:
+        failure = '' if e.code in (None, 0) else str(e.code)
+        raise
+    except BaseException as e:
+        failure = '%s: %s' % (type(e).__name__, e)
+        raise
+    finally:
+        if '--plan' not in sys.argv:
+            report_health(failure)
