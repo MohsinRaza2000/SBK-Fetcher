@@ -65,6 +65,13 @@ GLOBAL_MIN_GAP = 1.5
 # Variables (AAA_DAILY_BUDGET, AAA_RUN_LIMIT); neither is raised without the owner.
 DAILY_BUDGET = int(os.environ.get('AAA_DAILY_BUDGET', '10000'))
 RUN_LIMIT    = int(os.environ.get('AAA_RUN_LIMIT', '600'))
+# ONE day's catch-up, on that UTC day only (the owner, 25 September 2026: "start
+# today, but safely"). The restart loop of 24-25 September left about 1.1 lakh
+# rows unread; 6,000 more requests on this one day go to them - the SAME 1.5 s
+# between requests and the same 600 a run, so no minute is any busier than any
+# other day's, and tomorrow the allowance is back to 10,000 by itself.
+CATCH_UP = {'2026-09-25': 6000}
+DAILY_BUDGET += CATCH_UP.get(time.strftime('%Y-%m-%d', time.gmtime()), 0)
 
 # ---------------------------------------------------------------------------
 # THE ORDER THE SOURCE SERVES ROWS IN - and why, until 19 September 2026, this
