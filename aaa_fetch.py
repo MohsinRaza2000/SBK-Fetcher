@@ -65,13 +65,17 @@ GLOBAL_MIN_GAP = 1.5
 # Variables (AAA_DAILY_BUDGET, AAA_RUN_LIMIT); neither is raised without the owner.
 DAILY_BUDGET = int(os.environ.get('AAA_DAILY_BUDGET', '10000'))
 RUN_LIMIT    = int(os.environ.get('AAA_RUN_LIMIT', '600'))
-# ONE day's catch-up, on that UTC day only (the owner, 25 September 2026: "start
-# today, but safely"). The restart loop of 24-25 September left about 1.1 lakh
-# rows unread; 6,000 more requests on this one day go to them - the SAME 1.5 s
-# between requests and the same 600 a run, so no minute is any busier than any
-# other day's, and tomorrow the allowance is back to 10,000 by itself.
-CATCH_UP = {'2026-09-25': 6000}
-DAILY_BUDGET += CATCH_UP.get(time.strftime('%Y-%m-%d', time.gmtime()), 0)
+# CATCH-UP, EVERY DAY - BUT ONLY WHILE IT BRINGS ROWS IN (the owner, 25 September
+# 2026: "not just today - every day, safely, the way the auction runs"). A day may
+# spend CATCH_UP more requests on history, and only while history is filling gaps:
+# DRY_PAGES history pages in a row that bring nothing close history until the next
+# UTC day. That is the guard the restart loop of 24-25 September lacked - it spent
+# about 13,000 requests on 0 rows. The 1.5 s between requests and a run's 600 are
+# unchanged, so no minute is busier than before; on a day with nothing missing,
+# none of it is spent (a complete window costs one look at its first page).
+CATCH_UP  = int(os.environ.get('AAA_CATCH_UP', '6000'))
+DAILY_BUDGET += CATCH_UP
+DRY_PAGES = 600
 
 # ---------------------------------------------------------------------------
 # THE ORDER THE SOURCE SERVES ROWS IN - and why, until 19 September 2026, this
@@ -117,6 +121,19 @@ DAILY_BUDGET += CATCH_UP.get(time.strftime('%Y-%m-%d', time.gmtime()), 0)
 #            are left, so the recent check always has something to spend.
 RECENT_DAYS  = 5
 RECENT_EVERY = 90 * 60
+# THE NEWEST DAY AS SOON AS THE SOURCE HAS IT - the auction harvester's way: look
+# often where things change, seldom where they do not. The source publishes a sale
+# day's results in one batch in Japan's early morning: the first rows of 21, 22 and
+# 23 September all came in at 21:00 UTC (06:00 JST), when a 90-minute look next came
+# round. From 19:00 to 23:00 UTC the newest days are looked at every 20 minutes, so a
+# published day is in the portal within about half an hour; the rest of the day, 90.
+FAST_FROM, FAST_TO = 19, 23          # UTC hours
+FAST_EVERY = 20 * 60
+
+
+def recent_every(now):
+    """How often the newest days are looked at, at this moment."""
+    return FAST_EVERY if FAST_FROM <= time.gmtime(now).tm_hour < FAST_TO else RECENT_EVERY
 HISTORY_DAYS = 88
 READ_ALL     = 30
 RESERVE      = int(os.environ.get('AAA_RESERVE', '2000'))
@@ -185,6 +202,10 @@ class Stop(Exception):
 
 class Reserve(Exception):
     """History has had its share of today; the rest is kept for the newest days."""
+
+
+class Dry(Reserve):
+    """History has read DRY_PAGES pages in a row that brought nothing - closed for today."""
 
 
 class Fatal(Exception):
@@ -284,6 +305,12 @@ def reserve_reached():
     """True once history has had its share of today's allowance."""
     left = THROTTLE.left()
     return bool(DAILY_BUDGET) and 0 <= left <= RESERVE
+
+
+def dry_closed(s):
+    """True once history has read DRY_PAGES pages in a row today that brought no row."""
+    d = s.get('dry') or {}
+    return d.get('day') == today_utc() and int(d.get('n', 0)) >= DRY_PAGES
 
 
 def new_opener():
@@ -709,6 +736,18 @@ class Job(object):
         with self.lock:
             self.s['cursor'].pop(key, None)
 
+    def dried(self, new):
+        """Count a history page read: one that brought rows resets the count; DRY_PAGES
+        in a row that brought none close history for the day (raises Dry)."""
+        with self.lock:
+            d = self.s.get('dry')
+            if not isinstance(d, dict) or d.get('day') != today_utc():
+                d = self.s['dry'] = {'day': today_utc(), 'n': 0}
+            d['n'] = 0 if new > 0 else int(d.get('n', 0)) + 1
+            shut = d['n'] >= DRY_PAGES
+        if shut:
+            raise Dry()
+
     def give_back(self, t):
         with self.lock:
             self.ti -= 1
@@ -981,7 +1020,9 @@ class Reader(object):
                 job.set_cursor(key, n, start, pg, way)       # stopped here, the next run starts here
                 rows, navi = self.ask(vid, pg, d1, d2, settled, want=True)
                 asked[0] += 1
-                self.put(rows, name)
+                new = self.put(rows, name)
+                if settled:
+                    job.dried(new)          # the dry-pages guard (see CATCH_UP)
                 if job.ledger.count(up, d1, d2) >= n:
                     return True
             return False
@@ -1057,11 +1098,15 @@ def worker(wid, job, sessions):
             job.say('[%s] BLOCKED: %s -- the source is refusing us. Stopping every reader.' % (tag, e))
             job.halt('blocked', blocked=True)
             return
-        except Reserve:
+        except Reserve as e:
             if not job.history_off:
                 job.history_off = True
-                job.say('[%s] history has had its share of today (%s requests are kept for the '
-                        'newest days) - it carries on tomorrow' % (tag, format(RESERVE, ',')))
+                if isinstance(e, Dry):
+                    job.say('[%s] history read %s pages in a row that brought nothing - closed for '
+                            'today, it carries on tomorrow where it stopped' % (tag, format(DRY_PAGES, ',')))
+                else:
+                    job.say('[%s] history has had its share of today (%s requests are kept for the '
+                            'newest days) - it carries on tomorrow' % (tag, format(RESERVE, ',')))
         except Stop:
             return
         except Fatal as e:
@@ -1102,14 +1147,15 @@ def plan(job, now, only=''):
     else:
         win = '%s|%s' % (iso(r_from), iso(r_to))
         rp = s.get('recent') or {}
-        if rp.get('window') != win or (not rp.get('left') and now - float(rp.get('at', 0)) >= RECENT_EVERY):
+        if rp.get('window') != win or (not rp.get('left') and now - float(rp.get('at', 0)) >= recent_every(now)):
             rp = {'window': win, 'at': now, 'left': list(vids)}
             s['recent'] = rp
         left = set(rp.get('left') or [])
         tasks += [('R', v, r_from, r_to) for v in vids if v in left]
 
-    # History waits while today's reserve is all that is left.
-    if not reserve_reached():
+    # History waits while today's reserve is all that is left, or once it has read
+    # DRY_PAGES pages in a row today that brought nothing.
+    if not reserve_reached() and not dry_closed(s):
         for a, b in month_chunks(h_from, h_to):
             for v in vids:
                 key = '%s|%s|%s' % (v, iso(a), iso(b))
@@ -1121,7 +1167,13 @@ def plan(job, now, only=''):
 def seconds_to_next(s, now):
     """How long until there is something to ask the source again."""
     rp = s.get('recent') or {}
-    due = 0.0 if rp.get('left') else float(rp.get('at', 0)) + RECENT_EVERY - now
+    due = 0.0 if rp.get('left') else float(rp.get('at', 0)) + recent_every(now) - now
+    if due > 0 and recent_every(now) == RECENT_EVERY:
+        # waiting through the quiet hours must not sleep past the start of the busy ones
+        t = time.gmtime(now)
+        until_fast = ((FAST_FROM - t.tm_hour) % 24) * 3600 - t.tm_min * 60 - t.tm_sec
+        if 0 < until_fast < due:
+            due = until_fast
     wait = min(due, next_change(now))
     if THROTTLE.left() == 0:
         wait = max(wait, 86400 - (now % 86400) + 30)     # the allowance comes back at 00:00 UTC
