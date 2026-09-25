@@ -123,6 +123,29 @@ SLACK        = 5
 RECENT_SLACK = 0.02
 JST          = datetime.timedelta(hours=9)
 
+# ---------------------------------------------------------------------------
+# WHAT THE 24 SEPTEMBER 2026 LOGS SHOWED, and the three rules that answer it.
+#
+# 1. A big day that needs more pages than one run may spend was read from the
+#    same page every run. TOYOTA 27 Aug (about 8,500 rows) was short by a few
+#    rows scattered through its A-Z list; reading backwards from where our rows
+#    end takes ~420 pages, two readers share a run's 600, so each got ~300, the
+#    run ended, and the next run started the day again - ten runs, 5,800 of the
+#    day's 10,000 requests, 0 new rows. Now where a read stopped is kept
+#    (state 'cursor': the source's count, the page to go on from, which way),
+#    and the next run carries on from that page. A changed count starts afresh.
+# 2. Pages that bring rows come first. Reading a day's A-Z tail fills about 20
+#    rows a page; hunting a handful of rows backwards through a whole day fills
+#    almost none. So in a round every window has its forward read first, and
+#    the backward hunts wait until nothing else is left (`deferred`).
+# 3. An empty answer from a session that answered WITH rows a moment ago is
+#    not a lapsed session. The source's empty answers do not carry the member
+#    mark, so every small maker with nothing in a window cost a fresh sign-in
+#    (4 requests) and a second ask - about 20 of every recent check's 98. Now
+#    it is believed for the moment: a recent window is simply looked at again
+#    at the next check, a settled one again tomorrow - never filed empty for good.
+FRESH_SECS   = 300
+
 
 def today_utc():
     return time.strftime('%Y-%m-%d', time.gmtime())
@@ -525,7 +548,7 @@ def load_state():
     # reader; carrying them would only make the file lie about what it does.
     for k in OLD_KEYS:
         s.pop(k, None)
-    for k in ('done', 'short', 'rshort', 'later'):
+    for k in ('done', 'short', 'rshort', 'later', 'cursor'):
         if not isinstance(s.get(k), dict):
             s[k] = {}
     s.setdefault('sent', 0)
@@ -552,6 +575,10 @@ def prune(s, r_from, h_from):
         del s['rshort'][key]
     for key in [x for x, t in s['later'].items() if time.time() - t >= 86400]:
         del s['later'][key]
+    # A read left half-way is carried on for three days; after that it starts afresh.
+    for key in [x for x, c in s['cursor'].items()
+                if x.split('|')[-1] < old or time.time() - float((c or {}).get('t', 0)) >= 3 * 86400]:
+        del s['cursor'][key]
 
 
 # ------------------------------------------------------------------- ledger
@@ -596,6 +623,11 @@ class Job(object):
         self.fatal = False
         self.history_off = False
         self.tasks, self.ti = [], 0
+        # Rule 2: windows whose forward read is done but which still need the
+        # pages before it wait here until every window has had its forward read.
+        self.allow_back = False
+        self.deferred = []
+        self.first = {}         # window -> the source's count, from its page 1 earlier this round
         self.busy = {}          # reader id -> when it took the window it is on
         self.failed = set()     # windows that raised this round - not retried in this run
         self.bad_streak = 0     # windows in a row that failed; three stop the run
@@ -624,13 +656,51 @@ class Job(object):
 
     def take(self):
         with self.lock:
-            while self.ti < len(self.tasks):
-                t = self.tasks[self.ti]
-                self.ti += 1
-                if t[0] == 'H' and self.history_off:
+            while True:
+                while self.ti < len(self.tasks):
+                    t = self.tasks[self.ti]
+                    self.ti += 1
+                    if t[0] == 'H' and self.history_off:
+                        continue
+                    return t
+                if self.deferred and not self.allow_back:
+                    # Every window has had its forward read: now the backward hunts.
+                    self.allow_back = True
+                    self.tasks.extend(self.deferred)
+                    self.deferred = []
                     continue
-                return t
+                return None
+
+    def defer(self, task):
+        """A window that only the pages before its start can complete - later in the round."""
+        with self.lock:
+            self.bad_streak = 0
+            if self.allow_back:
+                self.tasks.append(task)      # the hunts have begun meanwhile: join them
+            else:
+                self.deferred.append(task)
+
+    def cursor(self, key, n):
+        """Where an unfinished read of this window stopped - while the source still counts it the same."""
+        with self.lock:
+            c = self.s['cursor'].get(key)
+            if isinstance(c, dict) and int(c.get('n', -1)) == int(n):
+                return dict(c)
+            self.s['cursor'].pop(key, None)
             return None
+
+    def cursor_dir(self, key):
+        with self.lock:
+            return (self.s['cursor'].get(key) or {}).get('dir')
+
+    def set_cursor(self, key, n, start, nxt, direction):
+        with self.lock:
+            self.s['cursor'][key] = {'n': int(n), 'start': int(start), 'next': int(nxt),
+                                     'dir': direction, 't': int(time.time())}
+
+    def drop_cursor(self, key):
+        with self.lock:
+            self.s['cursor'].pop(key, None)
 
     def give_back(self, t):
         with self.lock:
@@ -649,7 +719,8 @@ class Job(object):
     def pending(self):
         """Windows nobody has taken yet (history ones only while history may run)."""
         with self.lock:
-            return any(t[0] == 'R' or not self.history_off for t in self.tasks[self.ti:])
+            return (any(t[0] == 'R' or not self.history_off for t in self.tasks[self.ti:])
+                    or bool(self.deferred and not self.history_off))
 
     def long_busy(self, secs):
         with self.lock:
@@ -696,6 +767,7 @@ class Job(object):
 
     def mark(self, key, kind, n):
         with self.lock:
+            self.s['cursor'].pop(key, None)          # settled either way: no read to carry on
             for k in ('done', 'short', 'rshort', 'later'):
                 if k != kind:
                     self.s[k].pop(key, None)
@@ -728,8 +800,12 @@ class Reader(object):
 
     def __init__(self, tag, job, signed=None):
         self.tag, self.job = tag, job
+        self.alive = 0.0            # when this session last answered WITH rows (rule 3)
         self.op, self.form, makers = signed or login()
         job.saw(makers)
+
+    def fresh(self):
+        return time.time() - self.alive < FRESH_SECS
 
     def looks_ours(self, navi):
         """Is this empty answer marked the way answers WITH rows are for us?
@@ -758,6 +834,7 @@ class Reader(object):
                     if total_of(navi) < len(rows):
                         raise RuntimeError('an answer with rows but no total')
                     self.job.s['member'] = navi.get('is_user', '')
+                    self.alive = time.time()
                 return rows, navi
             except (Blocked, Spent):
                 raise
@@ -817,14 +894,30 @@ class Reader(object):
             known = job.known(key, ours)
             if known:
                 return known
-        rows, navi = self.ask(vid, 1, d1, d2, settled)
-        n = total_of(navi)
-        self.put(rows, name)
+            if not job.allow_back and job.cursor_dir(key) == 'b':
+                return 'deferred'       # its forward read is done; the rest waits (rule 2)
+        seen = job.first.get(key)
+        if seen:
+            # Its page 1 was read earlier this round (a window put back by rule 2):
+            # the count is known and its rows are in - no need to ask again.
+            n, navi = seen, {'rows': str(seen)}
+        else:
+            rows, navi = self.ask(vid, 1, d1, d2, settled)
+            n = total_of(navi)
+            self.put(rows, name)
+            job.first[key] = n
         ours = job.ledger.count(up, d1, d2)
         if ours >= n:
             if n > 0:
                 if settled:
                     job.mark(key, 'done', n)
+                return 'done'
+            if ours == 0 and not self.looks_ours(navi) and self.fresh():
+                # Rule 3: nothing here, from a session that answered with rows
+                # moments ago. Believed for now, never filed as empty for good.
+                if settled:
+                    job.mark(key, 'later', int(time.time()))
+                    return 'unsure'
                 return 'done'
             if (ours > 0 or not self.looks_ours(navi)) and not retried and job.may_doubt():
                 # "None" for days the source still keeps and we hold rows for - or
@@ -844,14 +937,18 @@ class Reader(object):
             return 'short'      # read to the end at exactly this size already
         last = -(-n // PAGE_ROWS)
         if last > READ_ALL and d1 != d2:
-            doubt = False
+            doubt = waits = False
             for d in days_newest(d1, d2):
-                doubt = (self.fill(vid, d, d, settled) == 'unsure') or doubt
+                r = self.fill(vid, d, d, settled)
+                doubt = doubt or r == 'unsure'
+                waits = waits or r == 'deferred'
             ours = job.ledger.count(up, d1, d2)
             if ours >= n:
                 if settled:
                     job.mark(key, 'done', n)
                 return 'done'
+            if waits:
+                return 'deferred'       # a day of it waits for its backward read
             if doubt:
                 if settled:
                     job.mark(key, 'later', int(time.time()))
@@ -861,17 +958,20 @@ class Reader(object):
         return self.read(vid, name, key, d1, d2, n, settled)
 
     def read(self, vid, name, key, d1, d2, n, settled):
-        """Read one short window, starting where our rows run out."""
+        """Read one short window, starting where our rows run out - or where the
+        last run stopped reading it (rule 1)."""
         job = self.job
         up = name.upper()
         last = -(-n // PAGE_ROWS)
         before = job.ledger.count(up, d1, d2)
-        start = max(2, min(last, before // PAGE_ROWS))
+        cur = job.cursor(key, n)
+        start = min(last, max(2, int(cur['start']))) if cur else max(2, min(last, before // PAGE_ROWS))
         slack = SLACK if settled else max(SLACK, int(n * RECENT_SLACK))
         asked = [1]
 
-        def sweep(pages):
+        def sweep(pages, way):
             for pg in pages:
+                job.set_cursor(key, n, start, pg, way)       # stopped here, the next run starts here
                 rows, navi = self.ask(vid, pg, d1, d2, settled, want=True)
                 asked[0] += 1
                 self.put(rows, name)
@@ -879,14 +979,27 @@ class Reader(object):
                     return True
             return False
 
-        whole = sweep(range(start, last + 1))
+        whole = False
+        if not cur or cur.get('dir') == 'f':
+            whole = sweep(range(int(cur['next']) if cur else start, last + 1), 'f')
         ours = job.ledger.count(up, d1, d2)
-        if not whole and start > 2 and n - ours > slack:
-            whole = sweep(range(start - 1, 1, -1))
+        # A hunt already under way goes on to its end: the slack decides whether
+        # one is begun, not whether one that found some rows is abandoned half-way.
+        hunting = bool(cur and cur.get('dir') == 'b' and int(cur['next']) < start - 1)
+        if not whole and start > 2 and (hunting or n - ours > slack):
+            if settled and not job.allow_back:
+                # Rule 2: the pages before the start hold a few rows at most; they
+                # are read once every window has had its forward read.
+                job.set_cursor(key, n, start, start - 1, 'b')
+                return 'deferred'
+            back = int(cur['next']) if (cur and cur.get('dir') == 'b') else start - 1
+            whole = sweep(range(min(back, start - 1), 1, -1), 'b')
             ours = job.ledger.count(up, d1, d2)
         if ours >= n:
             if settled:
                 job.mark(key, 'done', n)
+            else:
+                job.drop_cursor(key)
         else:
             job.mark(key, 'short' if settled else 'rshort', n)
         span = iso(d1) if d1 == d2 else '%s..%s' % (iso(d1)[5:], iso(d2)[5:])
@@ -925,8 +1038,10 @@ def worker(wid, job, sessions):
         with job.lock:
             job.busy[wid] = time.time()
         try:
-            rd.fill(vid, d1, d2, kind == 'H')
-            job.finished(task)
+            if rd.fill(vid, d1, d2, kind == 'H') == 'deferred':
+                job.defer(task)
+            else:
+                job.finished(task)
         except Spent as e:
             job.say('[%s] %s. Stopping - the rest waits for the next run.' % (tag, e))
             job.halt(str(e))
