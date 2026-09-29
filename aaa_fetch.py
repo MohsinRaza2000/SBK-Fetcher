@@ -1243,6 +1243,13 @@ def auction_due(s, now):
     return now - float((s.get('auction') or {}).get('at', 0) or 0) >= auction_every(now)
 
 
+def auction_wait(s, now):
+    """Seconds until the auction's pass falls due (a day when it is off)."""
+    if AUCTION_MODE not in ('survey', 'read'):
+        return 86400
+    return max(0, int(float((s.get('auction') or {}).get('at', 0) or 0) + auction_every(now) - now))
+
+
 def auction_book(s, n=0):
     """The auction's own share of today: add n, return what is left of it."""
     a = s.setdefault('auction', {})
@@ -1272,9 +1279,12 @@ def auction_survey(op):
     m = re.search(r'<form[^>]*id=["\']?poisk', h)
     if m:
         seg = h[m.start():h.find('</form>', m.start()) + 7]
+        # EVERY field, as the member's browser sends them. The first live read (29 Sep) left out
+        # the hidden lose_time_here_... field (as the Statistics' reader does, and gets rows) and
+        # all 32 halls answered 0 lots; the browser's own call carries it and got its rows.
         for tag in re.findall(r'<input[^>]*>', seg):
             n = re.search(r'name=[\'"]?([\w\[\]]+)', tag)
-            if n and not n.group(1).lower().startswith('lose_time_here'):
+            if n:
                 v = re.search(r'value=(["\'])(.*?)\1', tag, re.S)
                 form[n.group(1)] = v.group(2) if v else ''
     halls = []
@@ -1327,7 +1337,7 @@ def auction_pass(s, signed, time_left):
     a['err'] = ''            # this pass's fault only; ok_at is when a pass last ended clean (the signal)
     op, _form, makers = signed
     t0 = THROTTLE.this_run
-    tally = {'halls': 0, 'pages': 0, 'new': 0, 'pb': 0, 'retired': 0}
+    tally = {'halls': 0, 'pages': 0, 'new': 0, 'pb': 0, 'retired': 0, 'empty': 0}
     try:
         if auction_book(s) <= 0:
             print('auction: its share of today (%s) is spent' % format(AUCTION_BUDGET, ','), flush=True)
@@ -1362,6 +1372,15 @@ def auction_pass(s, signed, time_left):
                 if str(navi.get('is_user', '1')) != '1' and pg == 1:
                     raise RuntimeError('the auction answered as to a guest - the session has lapsed')
                 n = total_of(navi)
+                if pg == 1 and not n and count:
+                    # The survey counts lots and the loader answers none: not believed. Never a
+                    # whole read (the portal would retire our lots of this hall on its word), and
+                    # say what it answered.
+                    whole = False
+                    tally['empty'] += 1
+                    print('  auction: %s - the survey counts %d, the hall answered 0 (%s)'
+                          % (hall, count, ', '.join('%s=%s' % (k, navi.get(k)) for k in
+                                                    ('rows', 'xCnt', 'is_user', 'md', 'page', 'is_stat'))), flush=True)
                 if n0 is None:
                     n0, last = n, max(1, -(-n // PAGE_ROWS))
                 elif n != n0:
@@ -1374,7 +1393,11 @@ def auction_pass(s, signed, time_left):
             tally['retired'] += int(done.get('retired', 0))
             tally['halls'] += 1
             print('  auction: %-28s %5s lots, %3d pages%s | new %d' % (hall, format(n0 or 0, ','), last,
-                  '' if whole else ' (changed while read - nothing retired)', tally['new']), flush=True)
+                  '' if whole else ' (not a whole read - nothing retired)', tally['new']), flush=True)
+        if tally['halls'] >= 2 and tally['empty'] == tally['halls']:
+            # every hall answered 0 though the survey counts lots: the read is not working - a
+            # fault, so the portal's signal turns red if it lasts (the first live read, 29 Sep)
+            raise RuntimeError('every hall read (%d) answered 0 lots though the survey counts lots' % tally['halls'])
         m = auction_post('dedupe=1')
         if m.get('merged'):
             print('  auction: %d of ours folded into PB\'s rows (PB lists them now)' % m['merged'], flush=True)
@@ -1619,6 +1642,11 @@ def run():
         # the workflow starts the next run (.next) - which asks the source
         # nothing until there is something to ask.
         wait = seconds_to_next(s, time.time())
+        # ...or wake for the auction's pass when it falls due first (it used to wait for the
+        # next run's start - up to twenty minutes late)
+        aw = auction_wait(s, time.time())
+        if not a.plan and THROTTLE.left() != 0 and aw + 180 < time_left():
+            wait = min(wait, aw)          # the same conditions as the pass above, so it cannot spin
         if wait > time_left() - 90:
             time.sleep(max(0, time_left() - 60))
             break
