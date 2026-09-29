@@ -215,6 +215,15 @@ class Fatal(Exception):
 # How many runs in a row may be turned away at the door before the job stops
 # asking and says so out loud (a failed run = an e-mail to the owner).
 DOOR_LIMIT = 4
+# After that, ONE knock every DOOR_EVERY - one request, from whichever machine
+# GitHub gives the run - and the chain goes on between knocks (a run that is not
+# due to knock waits inside itself, asking nothing). 29 September 2026: the
+# source's /st?classic answered 404 from 04:30 UTC, the fourth refusal stopped the
+# chain at 04:32, and the only thing left to start it again was the schedule -
+# which GitHub runs every three to six hours, not every thirty minutes. The first
+# scheduled run, at 08:21, signed in at once. A person can still look after the
+# one e-mail; the portal's signal stays red until the source answers again.
+DOOR_EVERY = 30 * 60
 # After a refusal once signed in (or a fault no retry fixes) the job fails ONE
 # run - one e-mail - and then leaves the source alone this long, instead of
 # knocking again on every schedule. `--resume` ends the wait early.
@@ -835,6 +844,11 @@ class Job(object):
             if task[1] in left:
                 left.remove(task[1])
             if not left and rp:
+                # The next check is due `recent_every` from NOW, when this one is
+                # complete - not from when it was planned. A check planned at 04:30
+                # and read only at 08:21 (29 Sep 2026, the source's page was down in
+                # between) was otherwise begun again at once: 70 requests for nothing.
+                rp['at'] = time.time()
                 self.say('---- the newest sale days are checked for every maker (%s .. %s) ----'
                          % tuple(rp.get('window', '|').split('|')))
             save_state(self.s)
@@ -1181,13 +1195,40 @@ def seconds_to_next(s, now):
 
 
 # ---------------------------------------------------------------------- run
-def sign_in_first(s):
+def door_turn(s, time_left=None):
+    """Past DOOR_LIMIT refusals, is it this run's turn to knock? Waiting asks nothing.
+
+    Not yet due and not due inside this run: wait to the run's end and hand on
+    (`.next`), so the chain neither stops nor spins."""
+    door = int(s.get('door', 0) or 0)
+    if door < DOOR_LIMIT:
+        return True
+    wait = float(s.get('door_at', 0) or 0) + DOOR_EVERY - time.time()
+    if wait <= 0:
+        return True
+    left = time_left() if time_left else 1e9
+    if wait <= left - 90:
+        print('turned away at the door %d runs in a row - knocking again in %d min (one request)'
+              % (door, wait // 60 + 1), flush=True)
+        time.sleep(wait)
+        return True
+    print('turned away at the door %d runs in a row - the next knock is due in %d min, after this run; '
+          'waiting, then handing on' % (door, wait // 60 + 1), flush=True)
+    time.sleep(max(0.0, left - 60))
+    io.open(NEXT_MARK, 'w').write('next')
+    return False
+
+
+def sign_in_first(s, time_left=None):
     """The run's first sign-in, which is where a refusal at the door shows up."""
+    if not door_turn(s, time_left):
+        return None
     try:
         signed = login()
     except Door as e:
         door = int(s.get('door', 0) or 0) + 1
         s['door'] = door
+        s['door_at'] = time.time()
         save_state(s)                   # the refused request still counts against today
         if door < DOOR_LIMIT:
             io.open(RETRY_MARK, 'w').write('door')
@@ -1195,12 +1236,15 @@ def sign_in_first(s):
                   'account - asking again from another machine (%d of %d).'
                   % (e, door, DOOR_LIMIT - 1), flush=True)
             return None
+        # From here on: one knock every DOOR_EVERY, the chain going on between them.
+        io.open(NEXT_MARK, 'w').write('next')
         if door == DOOR_LIMIT:
-            print('turned away at the door %d runs in a row (%s). Stopping loudly so a person looks.'
-                  % (door, e), flush=True)
+            print('turned away at the door %d runs in a row (%s). Stopping loudly so a person looks - '
+                  'and knocking once every %d min until the source answers.'
+                  % (door, e, DOOR_EVERY // 60), flush=True)
             sys.exit(1)
         print('still turned away at the door (%d runs in a row; the owner was told at %d). '
-              'Trying again on the next schedule.' % (door, DOOR_LIMIT), flush=True)
+              'Knocking again in %d min.' % (door, DOOR_LIMIT, DOOR_EVERY // 60), flush=True)
         return None
     if s.get('door'):
         print('in again after %d refusal(s) at the door' % int(s['door']), flush=True)
@@ -1270,7 +1314,7 @@ def run():
             if not names:
                 if a.plan:
                     sys.exit('no maker list yet - it is learnt at the first sign-in')
-                first = sign_in_first(s)
+                first = sign_in_first(s, time_left)
                 if first is None:
                     return
                 names = dict(first[2])
@@ -1305,7 +1349,7 @@ def run():
         if tasks:
             if 0 not in sessions:
                 if first is None:
-                    first = sign_in_first(s)
+                    first = sign_in_first(s, time_left)
                     if first is None:
                         return
                 sessions[0] = Reader('w0', job, signed=first)

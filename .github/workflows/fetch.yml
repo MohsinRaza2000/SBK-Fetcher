@@ -30,7 +30,9 @@
 # 403 on the very first page, before signing in - nothing identifies us there but
 # that machine's address. The run ends quietly, leaves `.retry`, and the last step
 # asks for another machine. Four refusals in a row fail the run on purpose, which
-# e-mails the owner once.
+# e-mails the owner once - and from then on the job knocks ONCE every 30 minutes,
+# the chain going on between knocks (`.next`), rather than waiting for the
+# schedule below, which GitHub runs every three to six hours (29 Sep 2026).
 #
 # REFUSED AFTER SIGNING IN - the 16 September shape. Every reader stops, the run
 # fails on purpose (one e-mail), and the source is left alone for 24 hours rather
