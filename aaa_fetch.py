@@ -510,6 +510,22 @@ def report_health(error=''):
             'new': int(tally.get('new', 0)),
             'run': os.environ.get('GITHUB_RUN_ID', ''),
         }
+        # The auction pass (spec 009) has its own signal on the portal: red "aaajapan Auction
+        # not working" when it stops passing cleanly. A pass from before ok_at existed that left
+        # no fault counts as clean (that code never cleared err, so none means none ever).
+        au = s.get('auction') or {}
+        last = au.get('last') or {}
+        body['auction'] = {
+            'mode': AUCTION_MODE,
+            'at': int(float(au.get('at', 0) or 0)),
+            'ok_at': int(au.get('ok_at') or (0 if au.get('err') else float(au.get('at', 0) or 0))),
+            'err': str(au.get('err', '') or '')[:200],
+            'halls': int(last.get('halls', 0) or 0),
+            'pages': int(last.get('pages', 0) or 0),
+            'new': int(last.get('new', 0) or 0),
+            'used': int(au.get('used', 0) or 0) if au.get('day') == today_utc() else 0,
+            'budget': AUCTION_BUDGET,
+        }
         r = urllib.request.Request(PORTAL + '?t=' + INGEST_TOKEN + '&health=1',
                                    data=json.dumps(body).encode('utf-8'),
                                    headers={'User-Agent': 'aaa-fetch', 'Content-Type': 'application/json'})
@@ -1308,12 +1324,14 @@ def auction_pass(s, signed, time_left):
     spent allowance (Spent) goes up as everywhere else."""
     a = s.setdefault('auction', {})
     a['at'] = time.time()
+    a['err'] = ''            # this pass's fault only; ok_at is when a pass last ended clean (the signal)
     op, _form, makers = signed
     t0 = THROTTLE.this_run
     tally = {'halls': 0, 'pages': 0, 'new': 0, 'pb': 0, 'retired': 0}
     try:
         if auction_book(s) <= 0:
             print('auction: its share of today (%s) is spent' % format(AUCTION_BUDGET, ','), flush=True)
+            a['ok_at'] = int(time.time())
             return tally
         form, halls, onsale, sdate, stotal = auction_survey(op)
         auction_book(s, 1)
@@ -1324,6 +1342,7 @@ def auction_pass(s, signed, time_left):
               % (format(onsale, ','), plan.get('halls', 0), len(due),
                  '' if AUCTION_MODE == 'read' else ' (survey mode - none read)', format(stotal, ','), sdate), flush=True)
         if AUCTION_MODE != 'read':
+            a['ok_at'] = int(time.time())
             return tally
         names = sorted(set(str(v) for v in makers.values()))
         for d in due:
@@ -1359,6 +1378,7 @@ def auction_pass(s, signed, time_left):
         m = auction_post('dedupe=1')
         if m.get('merged'):
             print('  auction: %d of ours folded into PB\'s rows (PB lists them now)' % m['merged'], flush=True)
+        a['ok_at'] = int(time.time())
     except (Blocked, Spent):
         raise
     except Exception as e:
