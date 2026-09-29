@@ -1194,6 +1194,184 @@ def seconds_to_next(s, now):
     return max(0.0, wait)
 
 
+# --------------------------------------------------- the auction (spec 009, 29 September 2026)
+# The client's order: aaajapan's live auction joins the portal's auction beside Pacific
+# Boeki's - one list; a lot PB already has does not come twice, a lot PB lacks comes in, PB
+# loses nothing. This run reads it too: the same sign-in, the same 1.5 s clock (THROTTLE),
+# inside the same daily allowance, with a share of its own (AUCTION_BUDGET) so it can never
+# eat the Statistics' checks.
+#
+# ONE SURVEY REQUEST says what the source has: its search page (/aj_neo?classic) carries every
+# hall with its count, grouped by weekday (the page's own tpl_filterADV), and the totals. The
+# portal answers which halls are worth a read (aaa-auction-ingest.php ?survey) - it can see
+# PB's rows, this cannot. A hall is read page by page through the Statistics' own loader with
+# is_stat=0 and _auct_name; each page goes to the portal as it comes. A read that saw every
+# page, with the hall's count the same at its end, lets the portal retire our lots it did not
+# see.
+#
+#   AAA_AUCTION = off | survey | read    (survey: the one request and the plan, no hall read)
+AUCTION_MODE   = os.environ.get('AAA_AUCTION', 'survey').strip().lower()
+AUCTION_BUDGET = int(os.environ.get('AAA_AUCTION_BUDGET', '3000'))   # requests a UTC day, inside DAILY_BUDGET
+AUCTION_RUN    = int(os.environ.get('AAA_AUCTION_RUN', '250'))       # requests a run
+AUCTION_INGEST = PORTAL.replace('aaa-stats-ingest.php', 'aaa-auction-ingest.php')
+
+
+def auction_every(now):
+    """How often the survey runs: every 30 minutes while Japan's halls sell, else 90."""
+    return 30 * 60 if 8 <= jst_now(now).hour < 19 else 90 * 60
+
+
+def auction_due(s, now):
+    if AUCTION_MODE not in ('survey', 'read'):
+        return False
+    return now - float((s.get('auction') or {}).get('at', 0) or 0) >= auction_every(now)
+
+
+def auction_book(s, n=0):
+    """The auction's own share of today: add n, return what is left of it."""
+    a = s.setdefault('auction', {})
+    if a.get('day') != today_utc():
+        a['day'], a['used'] = today_utc(), 0
+    a['used'] = int(a.get('used', 0) or 0) + n
+    return max(0, AUCTION_BUDGET - a['used'])
+
+
+def auction_post(q, body=None):
+    """The portal's auction ingest - our own server, costs the source nothing."""
+    url = AUCTION_INGEST + '?t=' + INGEST_TOKEN + '&' + q
+    data = json.dumps(body).encode('utf-8') if body is not None else None
+    r = urllib.request.Request(url, data=data, headers={'User-Agent': 'aaa-fetch', 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(r, timeout=90, context=ctx) as x:
+        j = json.loads(x.read().decode('utf-8', 'replace'))
+    if not j.get('ok'):
+        raise RuntimeError('the auction ingest said: %s' % str(j)[:160])
+    return j
+
+
+def auction_survey(op):
+    """ONE request: the members' auction search - its form, every hall with its count per
+    weekday, the totals. Returns (form, halls, onsale, stat_date, stat_total)."""
+    h = aaa(op, BASE + '/aj_neo?classic', None, '/aj_neo?classic')
+    form = {}
+    m = re.search(r'<form[^>]*id=["\']?poisk', h)
+    if m:
+        seg = h[m.start():h.find('</form>', m.start()) + 7]
+        for tag in re.findall(r'<input[^>]*>', seg):
+            n = re.search(r'name=[\'"]?([\w\[\]]+)', tag)
+            if n and not n.group(1).lower().startswith('lose_time_here'):
+                v = re.search(r'value=(["\'])(.*?)\1', tag, re.S)
+                form[n.group(1)] = v.group(2) if v else ''
+    halls = []
+    fm = re.search(r'filterF:\[(.*?)\]\s*\}', h, re.S)
+    for names, weekday, dom in re.findall(r'\{a:"([^"]*)",b:"_auct_name",c:"([^"]*)",d:"(\d+)"\}', fm.group(1) if fm else ''):
+        for item in names.split(','):
+            im = re.match(r'^(.*?)\s*\((\d+)\)\s*$', item.strip())
+            if im:
+                halls.append([int(dom), weekday, im.group(1).strip(), int(im.group(2))])
+            elif item.strip():
+                halls.append([int(dom), weekday, item.strip(), 0])
+    on = re.search(r'Currently on sale <b>(\d+)</b>', h)
+    st = re.search(r'Past auction prices on <b>([\d.]+)</b><br>(\d+)', h)
+    if not form or not halls:
+        raise RuntimeError('the auction search page carried no form or no halls (%d bytes)' % len(h))
+    return form, halls, int(on.group(1)) if on else 0, st.group(1) if st else '', int(st.group(2)) if st else 0
+
+
+def auction_page(op, form, hall, pg):
+    """One page of one hall - the same loader and answer as the Statistics, is_stat=0."""
+    f = dict(form)
+    f.update({'url_loader': 'aj_neo?file=loader&Q=', 'page': str(max(1, pg)), 'is_stat': '0',
+              '_auct_name': hall, 'tpl': ''})
+    url = BASE + '/aj_neo?file=loader&ajx=' + str(int(time.time() * 1000)) + '0-form'
+    body = aaa(op, url, urllib.parse.urlencode(f), '/aj_neo?classic')
+    mm = re.search(r"'tpl_poisk':\s*'var data\s*=\s*(\{.*?\});'", body, re.S)
+    if not mm:
+        raise RuntimeError('the auction answer carried no result list (%d bytes)' % len(body))
+    raw = mm.group(1).replace('\\"', '"').replace("\\'", "'").replace('\\/', '/')
+    navi = {}
+    nm = re.search(r'navi:\{(.*?)\},\s*body:', raw, re.S)
+    if nm:
+        navi = dict(re.findall(r'(\w+):"([^"]*)"', nm.group(1)))
+    rows = []
+    bm = re.search(r'body:\[(.*)\]\s*\}\s*;?\s*$', raw, re.S)
+    if bm:
+        for one in re.findall(r'\{a:"(?:[^"\\]|\\.)*".*?\}(?=,\{a:"|$)', bm.group(1), re.S):
+            r = dict((k, v) for k, v in re.findall(r'(\w+):"((?:[^"\\]|\\.)*)"', one))
+            if r:
+                rows.append(r)
+    return rows, navi
+
+
+def auction_pass(s, signed, time_left):
+    """Survey, then (in read mode) the halls the portal says are worth it. Never raises for
+    an ordinary fault - it is noted and the Statistics carry on; a refusal (Blocked) or a
+    spent allowance (Spent) goes up as everywhere else."""
+    a = s.setdefault('auction', {})
+    a['at'] = time.time()
+    op, _form, makers = signed
+    t0 = THROTTLE.this_run
+    tally = {'halls': 0, 'pages': 0, 'new': 0, 'pb': 0, 'retired': 0}
+    try:
+        if auction_book(s) <= 0:
+            print('auction: its share of today (%s) is spent' % format(AUCTION_BUDGET, ','), flush=True)
+            return tally
+        form, halls, onsale, sdate, stotal = auction_survey(op)
+        auction_book(s, 1)
+        plan = auction_post('survey=1', {'onsale': onsale, 'stat_date': sdate, 'stat_total': stotal, 'halls': halls})
+        due = plan.get('due') or []
+        a['onsale'], a['stat_total'], a['stat_date'] = onsale, stotal, sdate
+        print('auction survey: %s on sale in %d halls | %d worth a read%s | statistics there %s (%s)'
+              % (format(onsale, ','), plan.get('halls', 0), len(due),
+                 '' if AUCTION_MODE == 'read' else ' (survey mode - none read)', format(stotal, ','), sdate), flush=True)
+        if AUCTION_MODE != 'read':
+            return tally
+        names = sorted(set(str(v) for v in makers.values()))
+        for d in due:
+            hall, count = str(d.get('hall', '')), int(d.get('count', 0) or 0)
+            pages_needed = max(1, -(-count // PAGE_ROWS))
+            spent_here = THROTTLE.this_run - t0
+            if (time_left() < 120 or auction_book(s) < pages_needed
+                    or spent_here + pages_needed > AUCTION_RUN
+                    or (THROTTLE.run_left() >= 0 and THROTTLE.run_left() < pages_needed + 20)):
+                continue            # a smaller hall may still fit; the rest wait for the next survey
+            since = int(auction_post('have=1').get('now', 0))
+            n0, whole, pg, last = None, True, 1, pages_needed
+            while pg <= last:
+                rows, navi = auction_page(op, form, hall, pg)
+                auction_book(s, 1)
+                tally['pages'] += 1
+                if str(navi.get('is_user', '1')) != '1' and pg == 1:
+                    raise RuntimeError('the auction answered as to a guest - the session has lapsed')
+                n = total_of(navi)
+                if n0 is None:
+                    n0, last = n, max(1, -(-n // PAGE_ROWS))
+                elif n != n0:
+                    whole = False          # the hall changed while it was read
+                res = auction_post('rows=1', {'hall': hall, 'makers': names, 'rows': rows})
+                tally['new'] += int(res.get('new', 0))
+                tally['pb'] += int(res.get('pb', 0))
+                pg += 1
+            done = auction_post('done=1', {'hall': hall, 'count': n0 or 0, 'since': since, 'whole': whole})
+            tally['retired'] += int(done.get('retired', 0))
+            tally['halls'] += 1
+            print('  auction: %-28s %5s lots, %3d pages%s | new %d' % (hall, format(n0 or 0, ','), last,
+                  '' if whole else ' (changed while read - nothing retired)', tally['new']), flush=True)
+        m = auction_post('dedupe=1')
+        if m.get('merged'):
+            print('  auction: %d of ours folded into PB\'s rows (PB lists them now)' % m['merged'], flush=True)
+    except (Blocked, Spent):
+        raise
+    except Exception as e:
+        a['err'] = str(e)[:200]
+        print('auction: stopped for this run - %s' % str(e)[:160], flush=True)
+    a['last'] = dict(tally, requests=THROTTLE.this_run - t0, at=int(time.time()))
+    if tally['halls']:
+        print('auction: %d halls read, %d pages, %d new lots, %d already PB\'s, %d retired | its share today %s of %s'
+              % (tally['halls'], tally['pages'], tally['new'], tally['pb'], tally['retired'],
+                 format(int(a.get('used', 0)), ','), format(AUCTION_BUDGET, ',')), flush=True)
+    return tally
+
+
 # ---------------------------------------------------------------------- run
 def door_turn(s, time_left=None):
     """Past DOOR_LIMIT refusals, is it this run's turn to knock? Waiting asks nothing.
@@ -1396,6 +1574,26 @@ def run():
 
         if a.once or not a.max_seconds:
             break
+        # The auction (spec 009): its survey is due and the Statistics have nothing to ask.
+        if not a.plan and auction_due(s, time.time()) and time_left() > 180 and THROTTLE.left() != 0:
+            if first is None:
+                first = sign_in_first(s, time_left)
+                if first is None:
+                    return
+            try:
+                auction_pass(s, first, time_left)
+            except Spent as e:
+                print('auction: %s' % e, flush=True)
+            except Blocked as e:
+                # the same rule as the Statistics' readers: refused once signed in -> every
+                # reader stops, one failed run (one e-mail), the source left alone HALT_HOURS
+                s['halted'] = {'why': 'blocked on the auction: %s' % str(e)[:120], 'at': time.time()}
+                save_state(s)
+                print('auction: BLOCKED (%s) - stopping; the source is left alone for %d hours'
+                      % (str(e)[:120], HALT_HOURS), flush=True)
+                sys.exit(1)
+            save_state(s)
+            continue
         # Nothing to ask for now. Wait inside this run for the next check of the
         # newest days if it comes before the run's end; otherwise end here, and
         # the workflow starts the next run (.next) - which asks the source
