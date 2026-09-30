@@ -1232,9 +1232,14 @@ AUCTION_RUN    = int(os.environ.get('AAA_AUCTION_RUN', '250'))       # requests 
 AUCTION_INGEST = PORTAL.replace('aaa-stats-ingest.php', 'aaa-auction-ingest.php')
 
 
+AUCTION_EVERY  = int(os.environ.get('AAA_AUCTION_EVERY', '600'))     # seconds between surveys
+
+
 def auction_every(now):
-    """How often the survey runs: every 30 minutes while Japan's halls sell, else 90."""
-    return 30 * 60 if 8 <= jst_now(now).hour < 19 else 90 * 60
+    """How often the survey runs: every ten minutes, day and night - PB's harvester's own rhythm
+    (the owner, 30 Sep: "B ko bhi waisa hi karo jaise A"). One request; WHICH halls are read and how
+    often (15 min for today's results ... 4 h for later days) is the portal's plan, as for PB."""
+    return AUCTION_EVERY
 
 
 def auction_due(s, now):
@@ -1345,7 +1350,9 @@ def auction_pass(s, signed, time_left):
             return tally
         form, halls, onsale, sdate, stotal = auction_survey(op)
         auction_book(s, 1)
-        plan = auction_post('survey=1', {'onsale': onsale, 'stat_date': sdate, 'stat_total': stotal, 'halls': halls})
+        # used/budget: past 80% of the day's share the portal doubles every wait (as PB's harvester does)
+        plan = auction_post('survey=1', {'onsale': onsale, 'stat_date': sdate, 'stat_total': stotal, 'halls': halls,
+                                         'used': int(a.get('used', 0) or 0), 'budget': AUCTION_BUDGET})
         due = plan.get('due') or []
         a['onsale'], a['stat_total'], a['stat_date'] = onsale, stotal, sdate
         print('auction survey: %s on sale in %d halls | %d worth a read%s | statistics there %s (%s)'
@@ -1389,7 +1396,9 @@ def auction_pass(s, signed, time_left):
                 tally['new'] += int(res.get('new', 0))
                 tally['pb'] += int(res.get('pb', 0))
                 pg += 1
-            done = auction_post('done=1', {'hall': hall, 'count': n0 or 0, 'since': since, 'whole': whole})
+            # sn: the survey's own count for the hall - the next survey is compared with it, never with
+            # the read's total (a hall under several weekdays: 698 a day in the survey, 863 read)
+            done = auction_post('done=1', {'hall': hall, 'count': n0 or 0, 'since': since, 'whole': whole, 'sn': count})
             tally['retired'] += int(done.get('retired', 0))
             tally['halls'] += 1
             print('  auction: %-28s %5s lots, %3d pages%s | new %d' % (hall, format(n0 or 0, ','), last,
