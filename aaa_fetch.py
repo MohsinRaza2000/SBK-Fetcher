@@ -224,6 +224,13 @@ DOOR_LIMIT = 4
 # scheduled run, at 08:21, signed in at once. A person can still look after the
 # one e-mail; the portal's signal stays red until the source answers again.
 DOOR_EVERY = 30 * 60
+# OUR OWN PORTAL not answering is not the source refusing. On 1 October 2026 the
+# host's database went away for a while, the portal answered a run's question
+# "what do you hold?" with an empty page at 07:56 UTC, and that run ended without
+# `.next` - leaving the chain to the schedule, which did not start it again for
+# five hours. Now the run asks the portal again every PORTAL_RETRY while it lasts
+# (the source is asked nothing meanwhile) and then hands on, like the door.
+PORTAL_RETRY = 2 * 60
 # After a refusal once signed in (or a fault no retry fixes) the job fails ONE
 # run - one e-mail - and then leaves the source alone this long, instead of
 # knocking again on every schedule. `--resume` ends the wait early.
@@ -1553,9 +1560,21 @@ def run():
                 have = portal_have(iso(h_from), iso(r_to + datetime.timedelta(days=1)))
             except RuntimeError as e:
                 # Without the portal's counts there is nothing to compare, and
-                # nowhere to put rows either. End quietly; the schedule tries again.
-                print('%s - ending this run without asking the source anything.' % e, flush=True)
+                # nowhere to put rows either - so the source is asked nothing. Ask
+                # the portal again while the run lasts, then hand on (PORTAL_RETRY).
+                if a.once or a.plan:            # a run by hand: say so and stop
+                    print('%s - ending this run without asking the source anything.' % e, flush=True)
+                    save_state(s)
+                    return
+                if time_left() > PORTAL_RETRY + 90:
+                    print('%s - asking the portal again in %d min (the source is asked nothing meanwhile).'
+                          % (e, PORTAL_RETRY // 60), flush=True)
+                    time.sleep(PORTAL_RETRY)
+                    continue
+                print('%s - still no answer at the end of this run; handing on to the next one '
+                      '(the source was asked nothing).' % e, flush=True)
                 save_state(s)
+                io.open(NEXT_MARK, 'w').write('next')
                 return
             ledger = Ledger(have)
             job = Job(s, names, ledger, a, began, tally)
