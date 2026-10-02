@@ -491,6 +491,56 @@ def portal_have(d1, d2):
     raise RuntimeError('the portal would not say what it holds: %s' % why)
 
 
+def portal_id():
+    """The ID the desk saved on the portal's Data sources page (spec 010, 2 Oct 2026).
+
+    {'rev': n, 'base': ..., 'user': ..., 'pass': ...}; rev 0 = nothing saved there, and
+    the GitHub secrets are used as before. Raises RuntimeError when the portal cannot
+    say. NOTHING from the answer is ever printed - this repository's Actions log is
+    public - and none of it goes into the state file, which is committed."""
+    url = PORTAL + '?t=' + INGEST_TOKEN + '&id=1'
+    why = ''
+    for attempt in range(3):
+        try:
+            r = urllib.request.Request(url, headers={'User-Agent': 'aaa-fetch'})
+            with urllib.request.urlopen(r, timeout=60, context=ctx) as x:
+                j = json.loads(x.read().decode('utf-8', 'replace'))
+            if j.get('ok'):
+                return j
+            why = 'it answered without the ID'
+        except urllib.error.HTTPError as e:
+            why = 'HTTP %s' % e.code          # never str(e) of a request: the URL carries the token
+        except Exception as e:
+            why = type(e).__name__
+        time.sleep(10 * (attempt + 1))
+    raise RuntimeError('the portal would not say which ID to use (%s)' % why)
+
+
+def apply_portal_id(pid, s):
+    """Sign in with the portal's saved ID from here on. A revision this job has not
+    used before is a NEW ID: whatever stop or door count the old one earned is not
+    its own, so both are dropped and it starts afresh."""
+    global BASE, USER, PW
+    rev = int(pid.get('rev') or 0)
+    if rev <= 0:
+        if s.get('id_rev'):
+            print('the portal has no saved ID any more - back to the one set up on GitHub', flush=True)
+            s['id_rev'] = 0
+        return
+    base = str(pid.get('base') or '').rstrip('/')
+    if re.match(r'^https://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(:\d{2,5})?(/[A-Za-z0-9._~/-]*)?$', base):
+        BASE = base
+    USER, PW = str(pid.get('user') or ''), str(pid.get('pass') or '')
+    RUN['id_rev'] = rev
+    if rev != int(s.get('id_rev') or 0):
+        lifted = s.pop('halted', None)
+        s['door'] = 0
+        s.pop('door_at', None)
+        s['id_rev'] = rev
+        print('a new ID was saved on the portal (revision %d) - starting afresh%s'
+              % (rev, ', its stop lifted' if lifted else ''), flush=True)
+
+
 def report_health(error=''):
     """Tell the portal how the aaajapan ID fared this run - it turns that into the
     green or red signal staff see on the Statistics page.
@@ -516,6 +566,8 @@ def report_health(error=''):
             'pages': int(tally.get('pages', 0)),
             'new': int(tally.get('new', 0)),
             'run': os.environ.get('GITHUB_RUN_ID', ''),
+            # which portal-saved ID this run signed in with (spec 010); 0 = the GitHub secrets
+            'id_rev': int(RUN.get('id_rev') or 0),
         }
         # The auction pass (spec 009) has its own signal on the portal: red "aaajapan Auction
         # not working" when it stops passing cleanly. A pass from before ok_at existed that left
@@ -1501,9 +1553,6 @@ def run():
 
     if not INGEST_TOKEN:
         sys.exit('AAA_INGEST_TOKEN must be set - the portal counts are behind it.')
-    if not (USER and PW) and not a.plan:
-        HEALTH.update(login='nocreds', why='AAA_USER / AAA_PASS are not set on GitHub')
-        sys.exit('AAA_USER and AAA_PASS must be set in the environment.')
     for mark in (NEXT_MARK, RETRY_MARK):
         if os.path.exists(mark):
             os.remove(mark)
@@ -1512,6 +1561,23 @@ def run():
     s = load_state()
     RUN['s'] = s                        # report_health() reads the stop and the door count from here
     THROTTLE.load(s.get('budget'))
+    # Which ID to sign in with: the one saved on the portal's Data sources page, if any
+    # (spec 010) - before the stop below is looked at, because a NEW ID lifts it.
+    if not a.plan:
+        try:
+            apply_portal_id(portal_id(), s)
+        except RuntimeError as e:
+            if s.get('id_rev'):
+                # This job has been on a portal-saved ID - most likely because the GitHub one
+                # stopped working. Never fall back to it: ask the source nothing, hand on.
+                print('%s - not falling back to an older ID; the source was asked nothing, handing on.' % e, flush=True)
+                save_state(s)
+                io.open(NEXT_MARK, 'w').write('next')
+                return
+            print('%s - signing in with the ID set up on GitHub.' % e, flush=True)
+    if not (USER and PW) and not a.plan:
+        HEALTH.update(login='nocreds', why='no username or password - neither on the portal nor on GitHub')
+        sys.exit('No username or password: save one on the portal (Data sources) or set AAA_USER / AAA_PASS.')
     if a.resume and s.pop('halted', None):
         print('resumed by hand', flush=True)
     stopped = s.get('halted')
